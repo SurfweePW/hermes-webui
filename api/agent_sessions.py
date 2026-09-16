@@ -707,7 +707,6 @@ def read_importable_agent_session_rows(
             except sqlite3.Error:
                 messages_index_present = False
 
-
         if use_messages_join:
             actual_count_expr = f"COUNT(m.{count_col})"
             if 'role' in message_cols:

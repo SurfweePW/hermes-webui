@@ -8716,6 +8716,18 @@ def _claim_or_synthesize_cli_session(sid: str, cli_meta: dict = None):
             if _ended or _started:
                 cli_meta["updated_at"] = _ended or _started
     claimable, _reason = _is_claimable_cli_source(cli_meta, state_db_source)
+    # A separate WebUI can project live profile state.db files while keeping
+    # its own sidecar store isolated. Existing CLI/TUI/Desktop rows are
+    # normally claimable, which materializes SESSION_DIR/<sid>.json on first
+    # open. That flat key is not profile-qualified and can collide across
+    # profile databases. The operator flag turns every foreign state.db row
+    # into a synthetic view-only Session. New WebUI sessions remain writable
+    # because they never enter this materialization path.
+    if str(os.getenv("HERMES_WEBUI_EXTERNAL_STATE_READ_ONLY", "")).strip().lower() in {
+        "1", "true", "yes", "on",
+    }:
+        claimable = False
+        _reason = "operator_read_only"
     if not claimable:
         # The session is real and viewable, but the foreign source forbids
         # the WebUI from taking write ownership.  Build the Session with
