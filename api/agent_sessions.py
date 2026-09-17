@@ -942,7 +942,14 @@ def _empty_lineage_report(session_id: str, *, found: bool = False) -> dict:
     }
 
 
-def read_session_lineage_report(db_path: Path, session_id: str | None, max_hops: int = 20) -> dict:
+def read_session_lineage_report(
+    db_path: Path,
+    session_id: str | None,
+    max_hops: int = 20,
+    *,
+    strict_read_only: bool = False,
+    raise_on_error: bool = False,
+) -> dict:
     """Return a bounded, read-only lifecycle report for a session lineage.
 
     This helper intentionally reports only facts that can be derived from
@@ -1063,6 +1070,8 @@ def read_session_lineage_report(db_path: Path, session_id: str | None, max_hops:
                         continue
                     child_rows.append(child)
     except Exception:
+        if raise_on_error:
+            raise
         return _empty_lineage_report(sid)
 
     root_id = segments[-1]['id'] if segments else sid

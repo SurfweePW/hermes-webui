@@ -10607,6 +10607,7 @@ from api.models import (
     load_projects,
     save_projects,
     import_cli_session,
+    _SESSION_FILE_WRITE_LOCK,
     CLAUDE_CODE_SOURCE,
     get_cli_sessions,
     get_cli_session_messages,
@@ -17814,6 +17815,10 @@ def handle_post(handler, parsed) -> bool:
     # ── CLI session import (POST) ──
     if parsed.path == "/api/session/import_cli":
         return _handle_session_import_cli(handler, body)
+
+    # ── Explicit, operator-gated Resume in WebUI (POST) ──
+    if parsed.path == "/api/session/resume_in_webui":
+        return _handle_session_resume_in_webui(handler, body)
 
     # ── Auth endpoints (POST) ──
     if parsed.path == "/api/auth/login":
@@ -29247,6 +29252,353 @@ def _handle_session_import_cli(handler, body):
                 }
             ),
             "imported": True,
+        },
+    )
+
+
+# ─ Safe backend Resume in WebUI (explicit, operator-gated handoff) ───────────
+#
+# While ``HERMES_WEBUI_EXTERNAL_STATE_READ_ONLY`` is set, foreign CLI/TUI/ACP/
+# Desktop sessions are projected from each profile's ``state.db`` as read-only
+# stubs and can never be materialised as writable WebUI sidecars
+# (``_claim_or_synthesize_cli_session`` forces ``claimable = False``). That
+# leaves an operator with no sanctioned way to *take over* a genuinely finished
+# foreign session from the WebUI, so this endpoint is the single, explicit path
+# that performs the handoff. It is deliberately narrow:
+#
+#   * operator allowlist (``HERMES_WEBUI_RESUME_ALLOW_PROFILES``) — unset means
+#     the endpoint is disabled entirely; a requested profile must be listed;
+#   * the requested profile must be the WebUI's active profile;
+#   * the server resolves ``<profile home>/state.db`` exactly (no active-profile
+#     fallback) and opens it strictly read-only;
+#   * only ``cli``/``tui``/``acp``/``desktop`` sources are resumable;
+#   * a source session that still looks live (no ``ended_at``/``end_reason``) is
+#     refused unless WebUI already owns a matching writable sidecar;
+#   * the client's exact lineage root + tip must match
+#     ``read_session_lineage_report``;
+#   * a flat sidecar id collision (the WebUI store is not profile-qualified) is
+#     refused when the existing sidecar is blank/other-profile;
+#
+# The endpoint never writes to the source ``state.db``: it opens it read-only
+# for every probe (row, lineage), then materialises the same session id as a
+# writable WebUI sidecar bound to the requested profile.
+_RESUME_IN_WEBUI_SOURCE_ALLOWLIST = frozenset({"cli", "tui", "acp", "desktop"})
+
+
+
+def _resume_in_webui_allowed_profiles() -> set:
+    """Return the operator allowlist of profiles permitted to resume.
+
+    Read at request time so operators can flip it without a restart. An unset
+    or blank value disables the endpoint (fail-closed).
+    """
+    raw = str(os.getenv("HERMES_WEBUI_RESUME_ALLOW_PROFILES", "") or "")
+    return {part.strip() for part in raw.split(",") if part.strip()}
+
+
+def _open_source_state_db_readonly(db_path: Path):
+    """Open *db_path* with a strict ``mode=ro`` URI and no writable fallback.
+
+    Unlike ``open_state_db_readonly`` there is deliberately no fallback to a
+    read-write handle: this endpoint must never be able to mutate the source
+    ``state.db`` it is resuming from. Callers own the returned connection.
+    """
+    uri = f"{Path(db_path).resolve().as_uri()}?mode=ro"
+    return sqlite3.connect(uri, uri=True)
+
+
+def _load_resume_sidecar_nonmutating(sidecar_path: Path):
+    """Load a resume sidecar without Session.load() self-heal writes."""
+    data = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("existing WebUI sidecar is not a JSON object")
+    return Session(**data)
+
+
+def _same_resume_identity(session, *, profile: str, db_path: Path, root_id: str, tip_id: str) -> bool:
+    return (
+        not bool(getattr(session, "read_only", False))
+        and _profiles_match(getattr(session, "profile", None), profile)
+        and (
+            getattr(session, "resume_source_profile", None),
+            getattr(session, "resume_source_state_db", None),
+            getattr(session, "resume_lineage_root_id", None),
+            getattr(session, "resume_lineage_tip_id", None),
+        )
+        == (profile, str(db_path), root_id, tip_id)
+    )
+
+
+def _read_source_session_row(db_path: Path, sid: str) -> dict | None:
+    """Return the source ``sessions`` row for *sid* via a strict read-only open.
+
+    Returns ``None`` when the row is absent or the schema is missing ``id``.
+    """
+    with closing(_open_source_state_db_readonly(db_path)) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute("PRAGMA table_info(sessions)")
+        cols = {str(row[1]) for row in cur.fetchall()}
+        if "id" not in cols:
+            return None
+        wanted = [
+            c for c in (
+                "id", "title", "model", "source", "session_source", "parent_session_id",
+                "started_at", "ended_at", "end_reason",
+            )
+            if c in cols
+        ]
+        cur.execute(
+            f"SELECT {', '.join(wanted)} FROM sessions WHERE id = ?",
+            (sid,),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+
+def _handle_session_resume_in_webui(handler, body):
+    """POST /api/session/resume_in_webui — explicit writable handoff.
+
+    Contract (body): ``{session_id, profile, lineage_root_id, lineage_tip_id,
+    confirm: true}``. See the module note above for the full gate list. Returns
+    the materialised (or already-owned) session projection.
+    """
+    if not isinstance(body, dict):
+        return bad(handler, "Request body must be a JSON object")
+
+    # Human confirmation is mandatory — this is the ONLY path that converts a
+    # foreign, read-only-projected session into a writable WebUI sidecar.
+    if body.get("confirm") is not True:
+        return bad(handler, "Resume requires confirm=true", 400)
+
+    try:
+        require(body, "session_id")
+    except ValueError as e:
+        return bad(handler, str(e))
+    sid = str(body.get("session_id") or "").strip()
+    if not is_safe_session_id(sid):
+        return bad(handler, "invalid session_id", 400)
+
+    # Validate the profile shape before the allowlist so a malformed name is a
+    # clean 400 (not a confusing 403), then fail closed on the operator gate.
+    profile = _normalize_import_profile_value(body.get("profile"))
+    if not profile:
+        return bad(handler, "invalid profile", 400)
+
+    lineage_root_id = str(body.get("lineage_root_id") or "").strip()
+    lineage_tip_id = str(body.get("lineage_tip_id") or "").strip()
+    if not lineage_root_id or not lineage_tip_id:
+        return bad(handler, "lineage_root_id and lineage_tip_id are required", 400)
+
+    allowed = _resume_in_webui_allowed_profiles()
+    if not allowed:
+        return bad(
+            handler,
+            "resume_in_webui is disabled; set HERMES_WEBUI_RESUME_ALLOW_PROFILES",
+            403,
+        )
+    if profile not in allowed:
+        return bad(handler, "profile is not allowed to resume in WebUI", 403)
+
+    # The requested profile must be the WebUI's current active profile: resuming
+    # a foreign profile's session while serving another profile would materialise
+    # a sidecar the user cannot actually use.
+    from api.profiles import get_active_profile_name, get_hermes_home_for_profile
+    if not _profiles_match(profile, get_active_profile_name()):
+        return bad(handler, "active profile does not match requested profile", 403)
+
+    # Resolve the exact ``<profile home>/state.db`` with no fallback. A missing
+    # DB is a hard 404 — never silently resolve the active profile's store.
+    try:
+        db_path = (Path(get_hermes_home_for_profile(profile)) / "state.db").resolve()
+    except (OSError, ValueError) as exc:
+        logger.exception("Failed to resolve source store for Resume in WebUI")
+        return bad(handler, _sanitize_error(exc), 500)
+    if not db_path.exists():
+        return bad(handler, "Session not found in source store", 404)
+
+    try:
+        source_row = _read_source_session_row(db_path, sid)
+    except (OSError, sqlite3.Error) as exc:
+        logger.exception("Failed to read source store for Resume in WebUI")
+        return bad(handler, _sanitize_error(exc), 500)
+    if source_row is None:
+        return bad(handler, "Session not found in source store", 404)
+
+    # Positive source allowlist: only sessions whose owning surface has
+    # demonstrably finished its own lifecycle may be taken over.
+    effective_source = (
+        str(source_row.get("source") or "").strip().lower()
+        or str(source_row.get("session_source") or "").strip().lower()
+    )
+    if effective_source not in _RESUME_IN_WEBUI_SOURCE_ALLOWLIST:
+        return bad(
+            handler,
+            f"source {effective_source or 'unknown'!r} is not resumable in WebUI",
+            403,
+        )
+
+    sidecar_path = SESSION_DIR / f"{sid}.json"
+    try:
+        existing = _load_resume_sidecar_nonmutating(sidecar_path) if sidecar_path.exists() else None
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        logger.warning("Refusing Resume in WebUI over unreadable existing sidecar: %s", _sanitize_error(exc))
+        return bad(handler, "an unreadable WebUI sidecar already owns this session id", 409)
+
+    # Concurrent-writer guard: an unended source session may still be appended
+    # to by the process that owns it. The only stronger ownership signal we
+    # accept is that WebUI already holds a matching writable sidecar (a prior
+    # explicit resume), which makes this an idempotent re-resume.
+    ended_at = source_row.get("ended_at")
+    end_reason = str(source_row.get("end_reason") or "").strip()
+    if not ended_at and not end_reason:
+        already_owned = (
+            existing is not None
+            and _profiles_match(getattr(existing, "profile", None), profile)
+            and not bool(getattr(existing, "read_only", False))
+        )
+        if not already_owned:
+            return bad(
+                handler,
+                "source session appears active; refusing to resume a session "
+                "that may still be written by another process",
+                409,
+            )
+
+    # Lineage must match the client's exact root + tip so a stale sidebar entry
+    # cannot resume a session whose continuation chain moved under it.
+    try:
+        report = read_session_lineage_report(
+            db_path,
+            sid,
+            strict_read_only=True,
+            raise_on_error=True,
+        )
+    except (OSError, sqlite3.Error) as exc:
+        logger.exception("Failed to read source lineage for Resume in WebUI")
+        return bad(handler, _sanitize_error(exc), 500)
+    if not report.get("found"):
+        return bad(handler, "Session not found in source store", 404)
+    if report.get("manual_review"):
+        return bad(
+            handler,
+            "lineage has a newer, branched, or ambiguous continuation; resume its current tip instead",
+            409,
+        )
+    if report.get("lineage_key") != lineage_root_id or report.get("tip_session_id") != lineage_tip_id:
+        return bad(handler, "lineage does not match the client's root/tip", 409)
+
+    if existing is not None:
+        existing_profile = getattr(existing, "profile", None)
+        # The WebUI sidecar store is a single flat directory; the same session
+        # id can collide across profiles. Refuse a blank or foreign-profile
+        # sidecar rather than silently overwriting another profile's session.
+        if not str(existing_profile or "").strip() or not _profiles_match(existing_profile, profile):
+            return bad(handler, "a different WebUI session already owns this session id", 409)
+        expected_identity = (
+            profile,
+            str(db_path),
+            lineage_root_id,
+            lineage_tip_id,
+        )
+        stored_identity = (
+            getattr(existing, "resume_source_profile", None),
+            getattr(existing, "resume_source_state_db", None),
+            getattr(existing, "resume_lineage_root_id", None),
+            getattr(existing, "resume_lineage_tip_id", None),
+        )
+        if bool(getattr(existing, "read_only", False)) or stored_identity != expected_identity:
+            return bad(
+                handler,
+                "an existing WebUI sidecar does not match this resume identity",
+                409,
+            )
+        return j(
+            handler,
+            {
+                "ok": True,
+                "resumed": False,
+                "idempotent": True,
+                "session": public_session_projection(
+                    existing.compact()
+                    | {
+                        "messages": existing.messages,
+                        "is_cli_session": bool(getattr(existing, "is_cli_session", True)),
+                    }
+                ),
+            },
+        )
+
+    from api.agent_sessions import SOURCE_LABELS
+    try:
+        messages = get_state_db_session_messages(
+            sid,
+            profile=profile,
+            state_db_path=db_path,
+            strict_read_only=True,
+            raise_on_error=True,
+        )
+    except (OSError, sqlite3.Error) as exc:
+        logger.exception("Failed to read source messages for Resume in WebUI")
+        return bad(handler, _sanitize_error(exc), 500)
+    title = str(source_row.get("title") or "").strip() or title_from(messages, "Resumed session")
+    model = str(source_row.get("model") or "").strip() or "unknown"
+    created_at = source_row.get("started_at")
+    updated_at = source_row.get("ended_at") or source_row.get("started_at")
+
+    try:
+        with _SESSION_FILE_WRITE_LOCK:
+            # Re-check under the lock used by every Session.save(). This makes
+            # sidecar ownership check + first complete write one serialized
+            # operation, while Session.save() rejects later profile/identity
+            # overwrites.
+            if sidecar_path.exists():
+                return bad(handler, "a WebUI sidecar claimed this session id; refresh and retry", 409)
+            s = import_cli_session(
+                sid,
+                title,
+                messages,
+                model,
+                profile=profile,
+                created_at=created_at,
+                updated_at=updated_at,
+                parent_session_id=source_row.get("parent_session_id"),
+                source_tag=effective_source,
+                raw_source=effective_source,
+                session_source=str(source_row.get("session_source") or effective_source),
+                source_label=SOURCE_LABELS.get(effective_source, effective_source.upper()),
+                read_only=False,
+                resume_source_profile=profile,
+                resume_source_state_db=str(db_path),
+                resume_lineage_root_id=lineage_root_id,
+                resume_lineage_tip_id=lineage_tip_id,
+            )
+            persisted = _load_resume_sidecar_nonmutating(sidecar_path)
+            if not _same_resume_identity(
+                persisted,
+                profile=profile,
+                db_path=db_path,
+                root_id=lineage_root_id,
+                tip_id=lineage_tip_id,
+            ):
+                raise RuntimeError("persisted sidecar failed resume identity verification")
+    except Exception as exc:
+        logger.exception("Failed to persist Resume in WebUI sidecar")
+        return bad(handler, _sanitize_error(exc), 500)
+    publish_session_list_changed("session_resume_in_webui", profile=profile)
+    return j(
+        handler,
+        {
+            "ok": True,
+            "resumed": True,
+            "idempotent": False,
+            "session": public_session_projection(
+                s.compact()
+                | {
+                    "messages": messages,
+                    "is_cli_session": True,
+                }
+            ),
         },
     )
 

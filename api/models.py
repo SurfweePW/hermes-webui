@@ -1268,6 +1268,9 @@ def _strip_sidebar_heavy_metadata(row: dict) -> dict:
     return row
 
 
+_SESSION_FILE_WRITE_LOCK = threading.RLock()
+
+
 class Session:
     def __init__(self, session_id: str=None, title: str='Untitled',
                  workspace=str(DEFAULT_WORKSPACE), created_workspace=None,
@@ -1418,6 +1421,15 @@ class Session:
         self.session_source = kwargs.get('session_source')
         self.source_label = kwargs.get('source_label')
         self.read_only = bool(kwargs.get('read_only', False))
+        # Internal identity for an explicit foreign-session handoff into WebUI.
+        # These fields are persisted in the sidecar but intentionally omitted
+        # from compact()/public projections. A flat SESSION_DIR key is not
+        # profile-qualified, so idempotent resume must match the full source
+        # identity rather than trusting a bare session_id.
+        self.resume_source_profile = kwargs.get('resume_source_profile')
+        self.resume_source_state_db = kwargs.get('resume_source_state_db')
+        self.resume_lineage_root_id = kwargs.get('resume_lineage_root_id')
+        self.resume_lineage_tip_id = kwargs.get('resume_lineage_tip_id')
         self.enabled_toolsets = enabled_toolsets  # List[str] or None — per-session toolset override
         self.composer_draft = composer_draft if isinstance(composer_draft, dict) else {}
         self.anchor_activity_scenes = anchor_activity_scenes if isinstance(anchor_activity_scenes, dict) else {}
@@ -1446,6 +1458,13 @@ class Session:
         return SESSION_DIR / f'{self.session_id}.json'
 
     def save(self, touch_updated_at: bool = True, skip_index: bool = False) -> None:
+        # Serialize the ownership check and atomic replace across every WebUI
+        # writer. Resume-in-WebUI uses the same lock while claiming a missing
+        # sidecar, so an unrelated writer cannot interleave a conflicting save.
+        with _SESSION_FILE_WRITE_LOCK:
+            return self._save_unlocked(touch_updated_at=touch_updated_at, skip_index=skip_index)
+
+    def _save_unlocked(self, touch_updated_at: bool = True, skip_index: bool = False) -> None:
         if not is_safe_session_id(self.session_id):
             raise ValueError(f"Unsafe session_id {self.session_id!r}; refusing to write outside session store")
         # ── #1558 P0 guard ──────────────────────────────────────────────
@@ -1493,6 +1512,8 @@ class Session:
             'parent_session_id',
             'worktree_path', 'worktree_branch', 'worktree_repo_root', 'worktree_created_at',
             'is_cli_session', 'source_tag', 'raw_source', 'session_source', 'source_label', 'read_only',
+            'resume_source_profile', 'resume_source_state_db',
+            'resume_lineage_root_id', 'resume_lineage_tip_id',
             'enabled_toolsets', 'composer_draft',
             'process_wakeup_pause',
             'share_token', 'share_created_at',
@@ -1541,6 +1562,24 @@ class Session:
                 try:
                     existing = json.loads(existing_text)
                     existing_msg_count = len(existing.get('messages') or [])
+                    existing_profile = str(existing.get('profile') or '').strip()
+                    incoming_profile = str(self.profile or '').strip()
+                    if existing_profile and existing_profile != incoming_profile:
+                        raise PermissionError(
+                            f"session sidecar is owned by profile {existing_profile!r}"
+                        )
+                    if existing_profile and not incoming_profile:
+                        raise PermissionError("session sidecar profile ownership cannot be cleared")
+                    resume_keys = (
+                        'resume_source_profile',
+                        'resume_source_state_db',
+                        'resume_lineage_root_id',
+                        'resume_lineage_tip_id',
+                    )
+                    existing_resume = tuple(existing.get(key) for key in resume_keys)
+                    incoming_resume = tuple(getattr(self, key, None) for key in resume_keys)
+                    if any(existing_resume) and existing_resume != incoming_resume:
+                        raise PermissionError("session sidecar resume ownership does not match")
                 except (json.JSONDecodeError, ValueError):
                     existing_msg_count = -1  # corrupt → always back up
                 incoming_msg_count = len(self.messages or [])
@@ -1583,6 +1622,10 @@ class Session:
                             bak_tmp.unlink(missing_ok=True)
                         except Exception:
                             pass
+        except PermissionError:
+            # Ownership violations are safety failures, not best-effort backup
+            # errors. Never continue to the atomic replace below.
+            raise
         except OSError:
             pass
 
@@ -6897,6 +6940,16 @@ def import_cli_session(
     created_at=None,
     updated_at=None,
     parent_session_id=None,
+    *,
+    source_tag=None,
+    raw_source=None,
+    session_source=None,
+    source_label=None,
+    read_only=False,
+    resume_source_profile=None,
+    resume_source_state_db=None,
+    resume_lineage_root_id=None,
+    resume_lineage_tip_id=None,
 ):
     """Create a new WebUI session populated with CLI/agent messages.
 
@@ -6914,6 +6967,16 @@ def import_cli_session(
         created_at=created_at,
         updated_at=updated_at,
         parent_session_id=parent_session_id,
+        is_cli_session=True,
+        source_tag=source_tag,
+        raw_source=raw_source,
+        session_source=session_source,
+        source_label=source_label,
+        read_only=read_only,
+        resume_source_profile=resume_source_profile,
+        resume_source_state_db=resume_source_state_db,
+        resume_lineage_root_id=resume_lineage_root_id,
+        resume_lineage_tip_id=resume_lineage_tip_id,
     )
     # #4985: import_cli_session uses an explicit sid (the CLI sidecar's id).
     # If that sid was previously tombstoned as a webui zero-message orphan,
@@ -8503,6 +8566,9 @@ def get_state_db_session_messages(
     include_inactive: bool = False,
     limit=None,
     with_revision: Literal[False] = False,
+    state_db_path=None,
+    strict_read_only: bool = False,
+    raise_on_error: bool = False,
 ) -> list: ...
 
 
@@ -8516,6 +8582,9 @@ def get_state_db_session_messages(
     include_inactive: bool = False,
     limit=None,
     with_revision: Literal[True],
+    state_db_path=None,
+    strict_read_only: bool = False,
+    raise_on_error: bool = False,
 ) -> StateDBSessionMessagesSnapshot: ...
 
 
@@ -8528,6 +8597,9 @@ def get_state_db_session_messages(
     include_inactive: bool = False,
     limit=None,
     with_revision: bool = False,
+    state_db_path=None,
+    strict_read_only: bool = False,
+    raise_on_error: bool = False,
 ):
     """Read messages for a Hermes session from state.db.
 
@@ -8567,23 +8639,32 @@ def get_state_db_session_messages(
     try:
         import sqlite3
     except ImportError:
+        if raise_on_error:
+            raise
         return _state_db_session_messages_result([], None, with_revision=with_revision)
 
-    if isinstance(profile, str) and profile:
+    if state_db_path is not None:
+        db_path = Path(state_db_path)
+    elif isinstance(profile, str) and profile:
         db_path = _get_profile_home(profile) / 'state.db'
     else:
         db_path = _active_state_db_path()
     if not db_path.exists():
+        if raise_on_error:
+            raise FileNotFoundError(f"state.db not found: {db_path}")
         return _state_db_session_messages_result([], None, with_revision=with_revision)
 
     try:
-        with closing(open_state_db_readonly(db_path)) as conn:
+        with closing(open_state_db_readonly(db_path, strict=strict_read_only)) as conn:
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
             cur.execute("PRAGMA table_info(messages)")
             available = {str(row['name']) for row in cur.fetchall()}
             required = {'role', 'content', 'timestamp'}
             if not required.issubset(available):
+                if raise_on_error:
+                    missing = ', '.join(sorted(required - available))
+                    raise sqlite3.DatabaseError(f"messages schema missing required columns: {missing}")
                 return _state_db_session_messages_result([], None, with_revision=with_revision)
             optional = [
                 'tool_call_id',
@@ -8754,6 +8835,8 @@ def get_state_db_session_messages(
                     _project_state_db_message(row, available, bool(id_col), optional)
                 )
     except Exception:
+        if raise_on_error:
+            raise
         return _state_db_session_messages_result([], None, with_revision=with_revision)
     return _state_db_session_messages_result(msgs, revision, with_revision=with_revision)
 
