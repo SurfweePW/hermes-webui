@@ -26842,7 +26842,7 @@ def _relay_gateway_run_approval(
     this chokepoint so one tab cannot retire another tab's parked remote run.
     """
     from api.config import gateway_supports_approval_identity_v1, get_config as _get_config
-    from api.gateway_chat import _gateway_api_key, _gateway_base_url
+    from api.gateway_chat import _gateway_api_key, _gateway_base_url_for_profile
     from api.runner_client import HttpRunnerClient, RunnerClientError
 
     run_id = str(mirror.get("run_id") or "").strip()
@@ -26884,7 +26884,11 @@ def _relay_gateway_run_approval(
                 enable_yolo=enable_yolo,
             )
 
-        base_url = _gateway_base_url(_get_config())
+        approval_session = get_session(sid)
+        base_url = _gateway_base_url_for_profile(
+            getattr(approval_session, "profile", None),
+            _get_config(),
+        )
         api_key = _gateway_api_key()
         identity_v1 = bool(current_mirror.get(_GATEWAY_AGENT_IDENTITY_V1)) and (
             gateway_supports_approval_identity_v1(base_url, api_key)

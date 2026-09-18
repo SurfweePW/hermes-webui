@@ -31,6 +31,7 @@ from api.config import (
     gateway_supports_approval,
     peek_stream,
     register_active_run,
+    stream_owner_session_id,
     unregister_active_run,
     unregister_stream_owner,
     update_active_run,
@@ -291,6 +292,19 @@ def _gateway_base_url(config_data=None, environ: dict[str, str] | None = None) -
         or "http://127.0.0.1:8642"
     ).strip()
     return raw.rstrip("/") or "http://127.0.0.1:8642"
+
+
+def _gateway_base_url_for_profile(
+    profile: str | None,
+    config_data=None,
+    environ: dict[str, str] | None = None,
+) -> str:
+    """Return the multiplexed Gateway URL for one WebUI session profile."""
+    base_url = _gateway_base_url(config_data, environ)
+    normalized = profile.strip() if isinstance(profile, str) else ""
+    if not normalized:
+        return base_url
+    return f"{base_url}/p/{urllib.parse.quote(normalized, safe='')}"
 
 
 def _gateway_api_key(environ: dict[str, str] | None = None) -> str:
@@ -789,6 +803,19 @@ def _run_gateway_runs_api_streaming(
     return final_text, usage
 
 
+def _gateway_profile_for_run(run_id: str) -> str | None:
+    """Resolve a gateway run to the profile that owns its WebUI stream."""
+    for stream_id, mapped_run_id in tuple(_STREAM_RUN_IDS.items()):
+        if str(mapped_run_id or "") != str(run_id or ""):
+            continue
+        owner_sid = stream_owner_session_id(stream_id)
+        owner_session = get_session(owner_sid) if owner_sid else None
+        profile = getattr(owner_session, "profile", None)
+        if isinstance(profile, str) and profile.strip():
+            return profile.strip()
+    return None
+
+
 def stop_gateway_run(run_id: str) -> bool:
     """Request gateway interruption and report whether it was acknowledged."""
     run_id = str(run_id or "").strip()
@@ -797,7 +824,7 @@ def stop_gateway_run(run_id: str) -> bool:
     from api.config import get_config
 
     cfg = get_config()
-    base_url = _gateway_base_url(cfg)
+    base_url = _gateway_base_url_for_profile(_gateway_profile_for_run(run_id), cfg)
     api_key = _gateway_api_key()
     headers = {"Accept": "application/json", "Content-Type": "application/json"}
     if api_key:
@@ -1012,7 +1039,7 @@ def _run_gateway_chat_streaming(
             model=model,
             model_provider=model_provider,
         )
-        base_url = _gateway_base_url(cfg)
+        base_url = _gateway_base_url_for_profile(getattr(s, "profile", None), cfg)
         api_key = _gateway_api_key()
         try:
             from api.config import _main_model_request_overrides
