@@ -1404,6 +1404,10 @@ async function send(){
     }
     return;
   }
+  if(typeof _isReadOnlySession==='function'&&_isReadOnlySession(S.session)){
+    if(typeof showToast==='function') showToast('Resume in WebUI before sending',2600);
+    return;
+  }
   _sendInProgress = true;
   try{
   const options=arguments[0]||{};

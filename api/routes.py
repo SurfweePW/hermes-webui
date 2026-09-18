@@ -14664,7 +14664,7 @@ def handle_get(handler, parsed) -> bool:
     if parsed.path == "/api/chat/stream/status":
         stream_id = parse_qs(parsed.query).get("stream_id", [""])[0]
         if not _stream_id_visible_to_request_profile(handler, stream_id):
-            return True
+            return j(handler, {"error": "stream is not visible to the active profile"}, status=403)
         active = stream_id in STREAMS
         payload = {"active": active, "stream_id": stream_id, "replay_available": False}
         try:
@@ -14681,7 +14681,7 @@ def handle_get(handler, parsed) -> bool:
         if not stream_id:
             return bad(handler, "stream_id required")
         if not _stream_id_visible_to_request_profile(handler, stream_id):
-            return True
+            return j(handler, {"error": "stream is not visible to the active profile"}, status=403)
         gateway_stop_blocked = False
         try:
             from api.gateway_chat import (
