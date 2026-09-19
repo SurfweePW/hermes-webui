@@ -373,7 +373,10 @@ def test_legacy_approval_records_run_id_for_response_relay():
             from api.routes import _handle_approval_respond
             _handle_approval_respond(handler, body)
 
-        assert captured.get("url", "") == "http://gw:8642/p/default/v1/runs/run-legacy-1/approval", (
+        # No mirror/session profile is bound, so the relay must use the unscoped
+        # owner URL rather than inventing "/p/default" (which could target the
+        # wrong profile).
+        assert captured.get("url", "") == "http://gw:8642/v1/runs/run-legacy-1/approval", (
             f"approval respond must relay to the gateway run; got {captured.get('url')!r}"
         )
         assert captured["body"] == {"choice": "once", "approval_id": ""}
@@ -696,7 +699,9 @@ def test_mirrored_run_id_survives_active_stream_loss():
              patch("api.runner_client.HttpRunnerClient._request_json", new=fake_request_json):
             routes._handle_approval_respond(handler, body)
 
-        assert captured.get("url", "") == f"http://gw:8642/p/default/v1/runs/{run_id}/approval", (
+        # Unbound mirror + session: unscoped owner URL, never an invented
+        # "/p/default" prefix.
+        assert captured.get("url", "") == f"http://gw:8642/v1/runs/{run_id}/approval", (
             f"approval respond must relay to the mirrored gateway run; got {captured.get('url')!r}"
         )
         assert captured["body"] == {"choice": "once", "approval_id": ""}

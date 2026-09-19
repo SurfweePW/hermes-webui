@@ -11,6 +11,12 @@ SESSION_RESUME_FALLBACK_KEYS = {
     "session_resume_in_webui_confirm_btn",
     "session_resume_in_webui_resumed",
     "session_resume_in_webui_failed",
+    # D6: localized, identifier-free failure categories. English owns them and
+    # every other locale inherits via the fallback chain.
+    "session_resume_in_webui_confirm_required",
+    "session_resume_in_webui_not_allowed",
+    "session_resume_in_webui_source_changed",
+    "session_resume_in_webui_conflict",
     "session_resume_in_webui_lineage_unavailable",
     "session_resume_in_webui_profile_mismatch",
     "session_resume_in_webui_required",

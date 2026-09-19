@@ -208,6 +208,122 @@ _SESSION_INDEX_REBUILD_THREAD_TARGET: tuple[Path, Path] | None = None
 _WEBUI_ZERO_MESSAGE_ORPHAN_TOMBSTONE_LOCK = threading.Lock()
 _WEBUI_DELETED_SESSION_TOMBSTONE_LOCK = threading.Lock()
 
+# ---------------------------------------------------------------------------
+# #765-preserving first-ownership gate (D1)
+# ---------------------------------------------------------------------------
+# Resume-in-WebUI publishes a canonical sidecar with an exclusive ``os.link``
+# claim. That claim is atomic against a *second* Resume, but an ordinary
+# ``Session.save()`` that already passed its ownership check can still reach
+# ``os.replace`` afterwards and clobber the freshly claimed artifact. The gate
+# below coordinates first ownership acquisition across every participating
+# writer WITHOUT reintroducing the process-global or per-session serialization
+# lock the #765 contract forbids:
+#
+#   * ``begin_session_save`` / ``end_session_save`` bracket one ordinary save.
+#     Two concurrent saves of the same id both register and still reach their
+#     distinct ``.tmp.<pid>.<tid>`` files and ``os.replace`` in parallel — the
+#     registry lock is held only for the momentary counter update, never across
+#     disk I/O. Saves of different ids never touch each other's state.
+#   * Resume refuses (409) while any ordinary writer for that id is active, so
+#     it never races a save that was admitted before the claim.
+#   * Once a Resume claim is active, new saves for that id refuse rather than
+#     queue, so the claim can never be overwritten mid-publication.
+#   * The persistent resume-identity guard in ``_write_sidecar_unlocked``
+#     remains the backstop that blocks a stale writer whose in-process
+#     registration lapsed (for example across a process restart).
+#
+# Nothing here serializes unrelated ids, and nothing here is held across I/O.
+_SESSION_CLAIM_LOCK = threading.Lock()
+_SESSION_CLAIM_STATE: dict[str, dict] = {}
+
+
+def begin_session_save(sid) -> bool:
+    """Register an ordinary canonical save for *sid*.
+
+    Returns ``False`` (a fail-closed refusal) when a Resume claim currently owns
+    the id; callers must not proceed to write. Concurrent ordinary saves of the
+    same id are all admitted — this is an active-writer count, not a lock.
+    """
+    sid = str(sid or "")
+    if not sid:
+        return True
+    with _SESSION_CLAIM_LOCK:
+        state = _SESSION_CLAIM_STATE.get(sid)
+        if state is None:
+            state = {"writers": 0, "claims": 0}
+            _SESSION_CLAIM_STATE[sid] = state
+        if int(state.get("claims", 0)) > 0:
+            return False
+        state["writers"] = int(state.get("writers", 0)) + 1
+        return True
+
+
+def end_session_save(sid) -> None:
+    """Release the ordinary-save registration taken by ``begin_session_save``."""
+    sid = str(sid or "")
+    if not sid:
+        return
+    with _SESSION_CLAIM_LOCK:
+        state = _SESSION_CLAIM_STATE.get(sid)
+        if state is None:
+            return
+        state["writers"] = max(0, int(state.get("writers", 0)) - 1)
+        if int(state.get("writers", 0)) == 0 and int(state.get("claims", 0)) == 0:
+            _SESSION_CLAIM_STATE.pop(sid, None)
+
+
+def claim_session_for_resume(sid) -> bool:
+    """Claim exclusive Resume ownership of *sid*.
+
+    Fail-closed: refuses (returns ``False``) while any ordinary writer is active
+    so a Resume can never race a save that was already admitted. Multiple
+    concurrent Resume requests may hold the claim simultaneously (each is
+    reconciled at the atomic ``os.link`` publication); the claim only needs to
+    block *ordinary saves*.
+    """
+    sid = str(sid or "")
+    if not sid:
+        return False
+    with _SESSION_CLAIM_LOCK:
+        state = _SESSION_CLAIM_STATE.get(sid)
+        if state is None:
+            state = {"writers": 0, "claims": 0}
+            _SESSION_CLAIM_STATE[sid] = state
+        if int(state.get("writers", 0)) > 0:
+            return False
+        state["claims"] = int(state.get("claims", 0)) + 1
+        return True
+
+
+def release_session_claim(sid) -> None:
+    """Release one Resume claim taken by ``claim_session_for_resume``."""
+    sid = str(sid or "")
+    if not sid:
+        return
+    with _SESSION_CLAIM_LOCK:
+        state = _SESSION_CLAIM_STATE.get(sid)
+        if state is None:
+            return
+        state["claims"] = max(0, int(state.get("claims", 0)) - 1)
+        if int(state.get("claims", 0)) == 0 and int(state.get("writers", 0)) == 0:
+            _SESSION_CLAIM_STATE.pop(sid, None)
+
+
+def evict_session_from_cache(sid) -> None:
+    """Drop *sid* from the in-memory ``SESSIONS`` cache under ``LOCK``.
+
+    Used when a canonical sidecar has been quarantined: any writable object that
+    a concurrent reader loaded during the publication window must not remain
+    retrievable. The next resolution reloads from disk (and fails closed when the
+    sidecar is gone).
+    """
+    sid = str(sid or "")
+    if not sid:
+        return
+    with LOCK:
+        SESSIONS.pop(sid, None)
+
+
 # Path-safety contract for session IDs.  Accept alphanumerics, underscore, and
 # hyphen so API/gateway-issued ids (``api-*``, ``reachy-voice-*``) round-trip
 # through filesystem load/save/delete/worktree paths without traversal risk.
@@ -1475,6 +1591,41 @@ class Session:
         return self._save_unlocked(touch_updated_at=touch_updated_at, skip_index=skip_index)
 
     def _save_unlocked(
+        self,
+        touch_updated_at: bool = True,
+        skip_index: bool = False,
+        *,
+        _target_path=None,
+        _publish_side_effects: bool = True,
+    ) -> None:
+        """Lock-free canonical save wrapped by the first-ownership gate (#765/D1).
+
+        The gate is a momentary active-writer *count*, not a lock: concurrent
+        saves of this id all register and still reach ``os.replace`` in parallel,
+        and unrelated ids are untouched. It only refuses while a Resume claim
+        owns the id; the claim in turn refuses while any writer is registered, so
+        the two can never overlap on the same canonical artifact. The gate is
+        skipped for staging writes, which target the private namespace rather than
+        the canonical id.
+        """
+        canonical = _target_path is None
+        if canonical and not begin_session_save(self.session_id):
+            raise PermissionError(
+                f"session {self.session_id!r} is being resumed in WebUI; "
+                f"refusing a concurrent save"
+            )
+        try:
+            return self._write_sidecar_unlocked(
+                touch_updated_at=touch_updated_at,
+                skip_index=skip_index,
+                _target_path=_target_path,
+                _publish_side_effects=_publish_side_effects,
+            )
+        finally:
+            if canonical:
+                end_session_save(self.session_id)
+
+    def _write_sidecar_unlocked(
         self,
         touch_updated_at: bool = True,
         skip_index: bool = False,

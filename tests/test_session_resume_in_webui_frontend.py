@@ -263,7 +263,11 @@ def test_confirm_names_session_and_owning_profile():
     assert "const profile = _sessionResumeInWebUiProfile(session);" in body
     assert "message: t('session_resume_in_webui_confirm_message', label, profile)," in body
     label_fn = _function_body(SESSIONS_JS, "_sessionResumeInWebUiLabel")
-    assert "_truncatedSessionId(session && session.session_id)" in label_fn
+    # D6: the confirmation label is the human title only — no internal session
+    # identifier is shown to the user.
+    assert "_truncatedSessionId" not in label_fn
+    assert "session.session_id" not in label_fn
+    assert "session.title || session.name" in label_fn
     profile_fn = _function_body(SESSIONS_JS, "_sessionResumeInWebUiProfile")
     assert "session.profile" in profile_fn
     assert "return raw;" in profile_fn
@@ -324,12 +328,26 @@ def test_failure_keeps_readonly_and_shows_concise_error():
     body = _function_body(SESSIONS_JS, "resumeSessionInWebUi")
     catch_idx = body.index("}catch(err){")
     catch_body = body[catch_idx:]
-    assert "showToast(t('session_resume_in_webui_failed') + detail, 6000, 'error');" in catch_body
+    # D6: only localized, identifier-free copy reaches the toast; the raw server
+    # text is routed to the console as technical detail.
+    assert "showToast(_resumeInWebUiErrorMessage(err), 6000, 'error');" in catch_body
     assert "return false;" in catch_body
     assert "loadSession" not in catch_body
     assert "_applyResumedSessionToSidebarCache" not in catch_body
-    # Only the error text (never a server body dump) is surfaced.
-    assert "err.message" in catch_body
+    assert "showToast(t('session_resume_in_webui_failed') + detail" not in catch_body
+    # Technical detail is logged, never appended to the user-visible toast.
+    mapper_idx = catch_body.index("console.warn('resume_in_webui failed', err);")
+    assert mapper_idx < catch_body.index("showToast(")
+    mapper_fn = _function_body(SESSIONS_JS, "_resumeInWebUiErrorMessage")
+    assert "err.message" in mapper_fn
+    for key in (
+        "session_resume_in_webui_confirm_required",
+        "session_resume_in_webui_not_allowed",
+        "session_resume_in_webui_source_changed",
+        "session_resume_in_webui_conflict",
+        "session_resume_in_webui_failed",
+    ):
+        assert key in mapper_fn
 
 
 def test_success_toast_key_present_and_no_english_hardcoding():
@@ -349,7 +367,8 @@ def test_english_i18n_keys_defined():
         "session_resume_in_webui_confirm_title": "Resume in WebUI?",
         "session_resume_in_webui_confirm_btn": "Resume",
         "session_resume_in_webui_resumed": "Session resumed in WebUI",
-        "session_resume_in_webui_failed": "Could not resume in WebUI: ",
+        "session_resume_in_webui_failed": "Could not resume this session. Please try again.",
+        "session_resume_in_webui_confirm_required": "Resume was not confirmed.",
     }
     for key, value in expected.items():
         assert f"{key}: '{value}'," in block, f"{key} missing from the English locale"

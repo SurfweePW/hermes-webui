@@ -1143,3 +1143,319 @@ def test_publish_refuses_to_clobber_an_occupied_id(resume_env):
     # A lost claim leaves the staging file for the caller to clean up; nothing
     # was published and nothing was destroyed.
     assert staging.exists()
+
+
+# ---------------------------------------------------------------------------
+# D1 — first-ownership gate: a pre-claim ordinary save can never clobber a
+# claimed Resume sidecar (audit probe: ``ordinary-save-race``), while ordinary
+# same-id saves still stay lock-free against each other (#765).
+# ---------------------------------------------------------------------------
+
+
+def test_ordinary_save_in_flight_makes_resume_refuse_without_clobbering(resume_env, monkeypatch):
+    """A save admitted before the claim must not be silently overwritten.
+
+    Reproduces the audit's ``ordinary-save-race`` probe: an ordinary same-id
+    save is parked immediately before ``os.replace`` when Resume arrives. The
+    gate must fail closed (409) while a writer is active so that a Resume can
+    never return 200 and then have its published sidecar overwritten.
+    """
+    sid = "sess-pre-claimed-writer"
+    _make_state_db(_alpha_db(resume_env), sid=sid, messages=3)
+    env = resume_env
+    models = env["models"]
+    routes = env["routes"]
+    sidecar = env["sessions_dir"] / f"{sid}.json"
+
+    parked = threading.Event()
+    release = threading.Event()
+    real_replace = models._safe_replace
+
+    def gated_replace(src, dst):
+        if str(dst).endswith(f"{sid}.json"):
+            parked.set()
+            assert release.wait(timeout=5)
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(models, "_safe_replace", gated_replace)
+
+    writer = models.Session(
+        session_id=sid,
+        title="Ordinary writer",
+        profile="alpha",
+        messages=[{"role": "user", "content": "writer"}],
+    )
+    writer_errors = []
+
+    def run_writer():
+        try:
+            writer.save(skip_index=True)
+        except Exception as exc:  # pragma: no cover - asserted below
+            writer_errors.append(exc)
+
+    saver = threading.Thread(target=run_writer, daemon=True)
+    saver.start()
+    assert parked.wait(timeout=5), "the ordinary save never reached os.replace"
+
+    # Resume arrives while the writer is in flight: it must refuse, never
+    # publish a sidecar that a stale writer can then overwrite.
+    routes._handle_session_resume_in_webui(env["rec"], _body(sid=sid))
+    assert env["rec"].status == 409, env["rec"].error()
+    assert "in flight" in env["rec"].error()
+    assert not sidecar.exists()
+
+    release.set()
+    saver.join(timeout=5)
+
+    assert not saver.is_alive()
+    assert not writer_errors, writer_errors
+    published = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert published["session_id"] == sid
+    assert published["profile"] == "alpha"
+    # Nothing claims a resume identity for this sidecar, and no gate state leaks.
+    assert not published.get("resume_source_profile")
+
+
+def test_claim_gate_state_is_released_after_success(resume_env):
+    """The gate must not leak per-session state once both sides finish."""
+    sid = "sess-gate-release"
+    _make_state_db(_alpha_db(resume_env), sid=sid, messages=2)
+    env = resume_env
+    models = env["models"]
+
+    env["routes"]._handle_session_resume_in_webui(env["rec"], _body(sid=sid))
+    assert env["rec"].status == 200, env["rec"].error()
+
+    assert sid not in models._SESSION_CLAIM_STATE
+    # A later ordinary save of the claimed sidecar is admitted again.
+    saved = models.Session.load(sid)
+    assert saved is not None
+    saved.messages.append({"role": "user", "content": "after resume"})
+    saved.save(skip_index=True)
+    assert sid not in models._SESSION_CLAIM_STATE
+
+
+def test_active_resume_claim_blocks_a_new_same_id_save(resume_env, monkeypatch):
+    """While a Resume claim is held, a new same-id save must refuse to write."""
+    sid = "sess-claim-blocks-save"
+    _make_state_db(_alpha_db(resume_env), sid=sid, messages=3)
+    env = resume_env
+    models = env["models"]
+    routes = env["routes"]
+    sidecar = env["sessions_dir"] / f"{sid}.json"
+
+    entered = threading.Event()
+    release = threading.Event()
+    real_link = models.os.link
+
+    def gated_link(src, dst):
+        entered.set()
+        assert release.wait(timeout=5)
+        return real_link(src, dst)
+
+    monkeypatch.setattr(models.os, "link", gated_link)
+
+    worker = threading.Thread(
+        target=routes._handle_session_resume_in_webui,
+        args=(env["rec"], _body(sid=sid)),
+        daemon=True,
+    )
+    worker.start()
+    assert entered.wait(timeout=5)
+
+    competing = models.Session(
+        session_id=sid,
+        title="late save",
+        profile="alpha",
+        messages=[{"role": "user", "content": "late"}],
+    )
+    with pytest.raises(PermissionError):
+        competing.save(skip_index=True)
+
+    release.set()
+    worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert env["rec"].status == 200, env["rec"].error()
+    published = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert published["resume_source_profile"] == "alpha"
+    assert len(published["messages"]) == 3
+    assert sid not in models._SESSION_CLAIM_STATE
+
+
+def test_concurrent_same_id_ordinary_saves_still_reach_replace_in_parallel(resume_env, monkeypatch):
+    """#765: the gate is a count, so two same-id saves still race in parallel."""
+    sid = "sess-lock-free-pair"
+    env = resume_env
+    models = env["models"]
+
+    barrier = threading.Barrier(2)
+    both_replaced = []
+    real_replace = models._safe_replace
+
+    def gated_replace(src, dst):
+        if str(dst).endswith(f"{sid}.json"):
+            both_replaced.append(threading.get_ident())
+            barrier.wait(timeout=5)
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(models, "_safe_replace", gated_replace)
+
+    errors = []
+
+    def run_writer(n):
+        session = models.Session(
+            session_id=sid,
+            title=f"writer {n}",
+            profile="alpha",
+            messages=[{"role": "user", "content": f"m{n}"}],
+        )
+        try:
+            session.save(skip_index=True)
+        except Exception as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=run_writer, args=(n,), daemon=True) for n in (1, 2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert not errors, errors
+    # Both writers reached os.replace and rendezvoused there: the gate never
+    # serialized them.
+    assert len(both_replaced) == 2
+    assert sid not in models._SESSION_CLAIM_STATE
+
+
+# ---------------------------------------------------------------------------
+# D2/D3/D4 — fail-closed post-publish verification, quarantine and cache/index
+# eviction (audit probes: ``late-source-change``, ``unreadable-publication``,
+# ``cached-quarantine``).
+# ---------------------------------------------------------------------------
+
+
+def test_source_change_after_final_snapshot_is_quarantined_fail_closed(resume_env, monkeypatch):
+    """A source that changes during publication must not yield a 200 + stale sidecar."""
+    env = resume_env
+    sid = "late-source-change"
+    db_path = _alpha_db(env)
+    _make_state_db(db_path, sid=sid, messages=3)
+    routes = env["routes"]
+    sidecar = env["sessions_dir"] / f"{sid}.json"
+    real_stage = routes.stage_session_sidecar
+    mutated = []
+
+    def mutate_during_stage(session, staging_path):
+        staged = real_stage(session, staging_path)
+        if not mutated:
+            mutated.append(True)
+            with sqlite3.connect(str(db_path)) as conn:
+                conn.execute(
+                    "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?,?,?,?)",
+                    (sid, "assistant", "late write", 1700000200.0),
+                )
+                conn.execute(
+                    "UPDATE sessions SET message_count = message_count + 1 WHERE id = ?",
+                    (sid,),
+                )
+        return staged
+
+    monkeypatch.setattr(routes, "stage_session_sidecar", mutate_during_stage)
+    routes._handle_session_resume_in_webui(env["rec"], _body(sid=sid))
+
+    assert mutated, "the source mutation never ran"
+    assert env["rec"].status == 500, env["rec"].error()
+    assert not sidecar.exists()
+    quarantined = list((env["sessions_dir"] / ".resume-quarantine").glob(f"{sid}-*.json"))
+    assert len(quarantined) == 1
+    assert sid not in (env["sessions_dir"] / "_index.json").read_text(encoding="utf-8")
+
+
+def test_unreadable_published_sidecar_is_quarantined_and_deindexed(resume_env, monkeypatch):
+    """A just-published sidecar that cannot be parsed must not stay live/indexed."""
+    env = resume_env
+    sid = "unreadable-publication"
+    _make_state_db(_alpha_db(env), sid=sid, messages=3)
+    routes = env["routes"]
+    sidecar = env["sessions_dir"] / f"{sid}.json"
+    real_publish = routes.publish_staged_session_sidecar
+
+    def publish_then_corrupt(session, staging_path):
+        real_publish(session, staging_path)
+        sidecar.write_text("{not valid json", encoding="utf-8")
+
+    monkeypatch.setattr(routes, "publish_staged_session_sidecar", publish_then_corrupt)
+    routes._handle_session_resume_in_webui(env["rec"], _body(sid=sid))
+
+    assert env["rec"].status == 500, env["rec"].error()
+    assert not sidecar.exists()
+    quarantined = list((env["sessions_dir"] / ".resume-quarantine").glob(f"{sid}-*.json"))
+    assert len(quarantined) == 1
+    index_text = (env["sessions_dir"] / "_index.json").read_text(encoding="utf-8")
+    assert sid not in index_text
+
+
+def test_quarantine_evicts_cached_writable_sidecar(resume_env, monkeypatch):
+    """A cached writable object must not survive quarantine."""
+    env = resume_env
+    sid = "cached-quarantine"
+    _make_state_db(_alpha_db(env), sid=sid, messages=3)
+    routes = env["routes"]
+    models = env["models"]
+    sidecar = env["sessions_dir"] / f"{sid}.json"
+    real_publish = routes.publish_staged_session_sidecar
+    cached_probe = []
+
+    def publish_then_cache(session, staging_path):
+        real_publish(session, staging_path)
+        cached = models.get_session(sid)
+        assert cached is not None
+        assert cached.read_only is False
+        cached_probe.append(cached)
+
+    monkeypatch.setattr(routes, "publish_staged_session_sidecar", publish_then_cache)
+    monkeypatch.setattr(routes, "_load_resume_sidecar_nonmutating", lambda _path: object())
+    routes._handle_session_resume_in_webui(env["rec"], _body(sid=sid))
+
+    assert cached_probe, "the cached writable object was never created"
+    assert env["rec"].status == 500, env["rec"].error()
+    assert not sidecar.exists()
+    # The stale writable object is gone from the cache and cannot be re-resolved.
+    assert sid not in models.SESSIONS
+    assert models.Session.load(sid) is None
+    assert sid not in (env["sessions_dir"] / "_index.json").read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# D4 (identity) — an idempotent re-resume must match the sidecar's own
+# ``session_id``, not just its resume identity (audit probe: ``sid-identity``).
+# ---------------------------------------------------------------------------
+
+
+def test_idempotent_resume_rejects_sidecar_with_foreign_session_id(resume_env):
+    """A hand-edited sidecar naming another session is never an idempotent match."""
+    env = resume_env
+    sid = "sid-identity-mismatch"
+    _make_state_db(_alpha_db(env), sid=sid, messages=3)
+    routes = env["routes"]
+    sidecar = env["sessions_dir"] / f"{sid}.json"
+
+    routes._handle_session_resume_in_webui(env["rec"], _body(sid=sid))
+    assert env["rec"].status == 200, env["rec"].error()
+
+    data = json.loads(sidecar.read_text(encoding="utf-8"))
+    data["session_id"] = "some-other-session"
+    sidecar.write_text(json.dumps(data), encoding="utf-8")
+
+    # The fixture's recorder is captured by the patched j()/bad(); reset it so
+    # only the second request's outcome is observed.
+    env["rec"].bad = None
+    env["rec"].j = None
+    routes._handle_session_resume_in_webui(env["rec"], _body(sid=sid))
+
+    assert env["rec"].status == 409, env["rec"].error()
+    assert env["rec"].bad is not None
+    assert "identity" in (env["rec"].error() or "")
+    # The foreign payload is left untouched, not silently adopted.
+    assert json.loads(sidecar.read_text(encoding="utf-8"))["session_id"] == "some-other-session"

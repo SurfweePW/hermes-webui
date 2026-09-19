@@ -26912,7 +26912,12 @@ def _relay_gateway_run_approval(
                 status=409,
                 enable_yolo=enable_yolo,
             )
-        gateway_profile = mirror_profile or session_profile or "default"
+        # Never invent an owning profile. When neither the immutable mirror
+        # binding nor the session sidecar names a profile, relay against the
+        # unscoped owner URL rather than guessing "/p/default", which could route
+        # the approval to the wrong profile. (``_gateway_base_url_for_profile``
+        # returns the unscoped base URL for an empty profile.)
+        gateway_profile = mirror_profile or session_profile
         base_url = _gateway_base_url_for_profile(
             gateway_profile,
             _get_config(),
@@ -29347,9 +29352,18 @@ def _load_resume_sidecar_nonmutating(sidecar_path: Path):
     return Session(**data)
 
 
-def _same_resume_identity(session, *, profile: str, db_path: Path, root_id: str, tip_id: str) -> bool:
+def _same_resume_identity(
+    session,
+    *,
+    sid: str,
+    profile: str,
+    db_path: Path,
+    root_id: str,
+    tip_id: str,
+) -> bool:
     return (
-        not bool(getattr(session, "read_only", False))
+        str(getattr(session, "session_id", None) or "") == str(sid)
+        and not bool(getattr(session, "read_only", False))
         and _profiles_match(getattr(session, "profile", None), profile)
         and (
             getattr(session, "resume_source_profile", None),
@@ -29364,6 +29378,7 @@ def _same_resume_identity(session, *, profile: str, db_path: Path, root_id: str,
 def _resume_existing_sidecar_conflict(
     session,
     *,
+    sid: str,
     profile: str,
     db_path: Path,
     root_id: str,
@@ -29382,6 +29397,11 @@ def _resume_existing_sidecar_conflict(
     # rather than silently overwriting another profile's session.
     if not str(existing_profile or "").strip() or not _profiles_match(existing_profile, profile):
         return "a different WebUI session already owns this session id"
+    # The sidecar's own session id must equal the requested source id: the
+    # filename supplies it implicitly, so a replaced/hand-edited body that names
+    # a different session must never be accepted as an idempotent re-resume (D4).
+    if str(getattr(session, "session_id", None) or "") != str(sid):
+        return "an existing WebUI sidecar does not match this resume identity"
     stored_identity = (
         getattr(session, "resume_source_profile", None),
         getattr(session, "resume_source_state_db", None),
@@ -29432,6 +29452,17 @@ def _quarantine_resume_sidecar(sidecar_path: Path, sid: str) -> Path | None:
     except Exception:
         logger.exception("Failed to quarantine untrusted resume sidecar %s", sidecar_path)
         target = None
+    # D3: evict any writable object a concurrent reader cached during the
+    # publication/read-back window BEFORE reconciling the index. Otherwise the
+    # full-rebuild reconciliation would re-advertise the rejected session from
+    # memory and a later read could still return a stale writable object.
+    try:
+        from api.models import evict_session_from_cache, prune_session_from_index
+
+        evict_session_from_cache(sid)
+        prune_session_from_index(sid)
+    except Exception:
+        logger.debug("Failed to evict cached resume sidecar %s", sid, exc_info=True)
     try:
         _write_session_index()
     except Exception:
@@ -29628,6 +29659,7 @@ def _handle_session_resume_in_webui(handler, body):
     if existing is not None:
         conflict = _resume_existing_sidecar_conflict(
             existing,
+            sid=sid,
             profile=profile,
             db_path=db_path,
             root_id=lineage_root_id,
@@ -29664,145 +29696,197 @@ def _handle_session_resume_in_webui(handler, body):
         / ".resume-staging"
         / f"{sid}.{uuid.uuid4().hex}.json"
     )
-    try:
-        # #765: no writer lock is taken anywhere on this path. Ordinary saves
-        # must stay free to race on their own ``.tmp.<pid>.<tid>`` files, so
-        # first publication is claimed atomically by
-        # ``publish_staged_session_sidecar`` (an exclusive ``os.link`` whose
-        # FileExistsError is reconciled below) instead of being serialized by
-        # ``session_file_write_lock``.
-        # Re-open one fresh read snapshot at the publication boundary. The
-        # first snapshot proves internal consistency; this second read
-        # detects any source-row, lineage, or transcript change that landed
-        # while the request was validating policy and sidecar ownership.
-        current_row, current_report, current_messages = _read_resume_source_snapshot(
-            db_path,
-            sid,
-            profile,
+    # D1: coordinate first ownership acquisition with every participating
+    # writer. The claim fails closed while an ordinary save for this id is
+    # already registered, and makes new saves for this id refuse while it is
+    # held; it never serializes ordinary saves against each other, so the #765
+    # lock-free same-session concurrent-save contract is preserved.
+    from api.models import claim_session_for_resume, release_session_claim
+    if not claim_session_for_resume(sid):
+        return bad(
+            handler,
+            "a save for this session is in flight; refresh and retry",
+            409,
         )
-        if (
-            current_row != source_row
-            or current_report != report
-            or current_messages != messages
-        ):
-            return bad(
-                handler,
-                "source session changed while Resume in WebUI was validating; refresh and retry",
-                409,
-            )
+    try:
         try:
-            candidate = import_cli_session(
+            # #765: no writer lock is taken anywhere on this path. Ordinary saves
+            # must stay free to race on their own ``.tmp.<pid>.<tid>`` files, so
+            # first publication is claimed atomically by
+            # ``publish_staged_session_sidecar`` (an exclusive ``os.link`` whose
+            # FileExistsError is reconciled below) instead of being serialized by
+            # ``session_file_write_lock``.
+            # Re-open one fresh read snapshot at the publication boundary. The
+            # first snapshot proves internal consistency; this second read
+            # detects any source-row, lineage, or transcript change that landed
+            # while the request was validating policy and sidecar ownership.
+            current_row, current_report, current_messages = _read_resume_source_snapshot(
+                db_path,
                 sid,
-                title,
-                messages,
-                model,
-                profile=profile,
-                created_at=created_at,
-                updated_at=updated_at,
-                parent_session_id=source_row.get("parent_session_id"),
-                source_tag=effective_source,
-                raw_source=effective_source,
-                session_source=str(source_row.get("session_source") or effective_source),
-                source_label=SOURCE_LABELS.get(effective_source, effective_source.upper()),
-                read_only=False,
-                resume_source_profile=profile,
-                resume_source_state_db=str(db_path),
-                resume_lineage_root_id=lineage_root_id,
-                resume_lineage_tip_id=lineage_tip_id,
-                persist=False,
+                profile,
             )
-            staged = stage_session_sidecar(candidate, staging_path)
             if (
-                not _same_resume_identity(
-                    staged,
-                    profile=profile,
-                    db_path=db_path,
-                    root_id=lineage_root_id,
-                    tip_id=lineage_tip_id,
-                )
-                or list(getattr(staged, "messages", []) or []) != messages
-                or bool(getattr(staged, "read_only", True))
+                current_row != source_row
+                or current_report != report
+                or current_messages != messages
             ):
-                raise RuntimeError("staged sidecar failed resume verification")
-            try:
-                # The canonical path does not exist until this exclusive atomic
-                # claim. Readers can observe either no writable sidecar or the
-                # fully serialized, verified payload — never a partially written
-                # or unverified window — and the claim is all-or-nothing against
-                # a concurrent Resume request or a concurrent Session.save().
-                publish_staged_session_sidecar(staged, staging_path)
-            except FileExistsError:
-                # Another writer won the claim for this id. Re-resolve the
-                # winner: the exact same resume identity is an idempotent
-                # re-resume, anything else is an ownership conflict.
-                try:
-                    published = _load_resume_sidecar_nonmutating(sidecar_path)
-                except Exception:
-                    _discard_resume_staging_file(staging_path)
-                    return bad(
-                        handler,
-                        "an unreadable WebUI sidecar already owns this session id",
-                        409,
-                    )
-                conflict = _resume_existing_sidecar_conflict(
-                    published,
-                    profile=profile,
-                    db_path=db_path,
-                    root_id=lineage_root_id,
-                    tip_id=lineage_tip_id,
+                return bad(
+                    handler,
+                    "source session changed while Resume in WebUI was validating; refresh and retry",
+                    409,
                 )
-                _discard_resume_staging_file(staging_path)
-                if conflict:
-                    return bad(handler, conflict, 409)
-                idempotent_after_race = True
-            else:
-                # Post-publish read-back: the canonical sidecar that is now
-                # visible must round-trip to the exact verified identity we
-                # measured. A mismatch means the artifact on disk cannot be
-                # trusted; quarantine it instead of serving it.
-                published = _load_resume_sidecar_nonmutating(sidecar_path)
+            try:
+                candidate = import_cli_session(
+                    sid,
+                    title,
+                    messages,
+                    model,
+                    profile=profile,
+                    created_at=created_at,
+                    updated_at=updated_at,
+                    parent_session_id=source_row.get("parent_session_id"),
+                    source_tag=effective_source,
+                    raw_source=effective_source,
+                    session_source=str(source_row.get("session_source") or effective_source),
+                    source_label=SOURCE_LABELS.get(effective_source, effective_source.upper()),
+                    read_only=False,
+                    resume_source_profile=profile,
+                    resume_source_state_db=str(db_path),
+                    resume_lineage_root_id=lineage_root_id,
+                    resume_lineage_tip_id=lineage_tip_id,
+                    persist=False,
+                )
+                staged = stage_session_sidecar(candidate, staging_path)
                 if (
                     not _same_resume_identity(
-                        published,
+                        staged,
+                        sid=sid,
                         profile=profile,
                         db_path=db_path,
                         root_id=lineage_root_id,
                         tip_id=lineage_tip_id,
                     )
-                    or list(getattr(published, "messages", []) or []) != messages
+                    or list(getattr(staged, "messages", []) or []) != messages
+                    or bool(getattr(staged, "read_only", True))
                 ):
-                    _quarantine_resume_sidecar(sidecar_path, sid)
-                    raise RuntimeError(
-                        "published sidecar failed post-publish verification"
+                    raise RuntimeError("staged sidecar failed resume verification")
+                try:
+                    # The canonical path does not exist until this exclusive atomic
+                    # claim. Readers can observe either no writable sidecar or the
+                    # fully serialized, verified payload — never a partially written
+                    # or unverified window — and the claim is all-or-nothing against
+                    # a concurrent Resume request or a concurrent Session.save().
+                    publish_staged_session_sidecar(staged, staging_path)
+                except FileExistsError:
+                    # Another writer won the claim for this id. Re-resolve the
+                    # winner: the exact same resume identity is an idempotent
+                    # re-resume, anything else is an ownership conflict.
+                    try:
+                        published = _load_resume_sidecar_nonmutating(sidecar_path)
+                    except Exception:
+                        _discard_resume_staging_file(staging_path)
+                        return bad(
+                            handler,
+                            "an unreadable WebUI sidecar already owns this session id",
+                            409,
+                        )
+                    conflict = _resume_existing_sidecar_conflict(
+                        published,
+                        sid=sid,
+                        profile=profile,
+                        db_path=db_path,
+                        root_id=lineage_root_id,
+                        tip_id=lineage_tip_id,
                     )
-            s = published
-        except Exception as persist_exc:
-            _discard_resume_staging_file(staging_path)
-            # If publication itself succeeded and only an index/tombstone
-            # side effect failed, reconcile the exact canonical identity as
-            # success. The sidecar was verified before it became visible.
-            try:
-                recovered = (
-                    _load_resume_sidecar_nonmutating(sidecar_path)
-                    if sidecar_path.exists()
-                    else None
-                )
-            except Exception:
-                recovered = None
-            if _same_resume_identity(
-                recovered,
-                profile=profile,
-                db_path=db_path,
-                root_id=lineage_root_id,
-                tip_id=lineage_tip_id,
-            ) and list(getattr(recovered, "messages", []) or []) == messages:
-                s = recovered
-                recovered_after_publish_error = True
-            else:
-                raise persist_exc
-    except Exception as exc:
-        logger.exception("Failed to persist Resume in WebUI sidecar")
-        return bad(handler, _sanitize_error(exc), 500)
+                    _discard_resume_staging_file(staging_path)
+                    if conflict:
+                        return bad(handler, conflict, 409)
+                    idempotent_after_race = True
+                else:
+                    # Post-publish read-back: the canonical sidecar that is now
+                    # visible must round-trip to the exact verified identity we
+                    # measured. A load failure (for example malformed JSON) is a
+                    # verification failure, not a crash: it must not leave an
+                    # unverified artifact live or indexed.
+                    try:
+                        published = _load_resume_sidecar_nonmutating(sidecar_path)
+                    except Exception:
+                        published = None
+                    verified = (
+                        published is not None
+                        and _same_resume_identity(
+                            published,
+                            sid=sid,
+                            profile=profile,
+                            db_path=db_path,
+                            root_id=lineage_root_id,
+                            tip_id=lineage_tip_id,
+                        )
+                        and list(getattr(published, "messages", []) or []) == messages
+                    )
+                    if verified:
+                        # D2: re-open the source one last time AFTER publication.
+                        # The pre-publication snapshot ends before staging and
+                        # publish, so a source writer can still revive the row in
+                        # that window. Fail closed and quarantine the freshly
+                        # published artifact when the source moved, rather than
+                        # returning 200 over stale read-only projection.
+                        try:
+                            final_row, final_report, final_messages = _read_resume_source_snapshot(
+                                db_path,
+                                sid,
+                                profile,
+                            )
+                        except Exception as exc:
+                            # Any inability to re-read the source is treated as
+                            # "the source may have moved": fail closed.
+                            logger.warning(
+                                "Failed to re-read source store after Resume publication: %s",
+                                _sanitize_error(exc),
+                            )
+                            verified = False
+                        else:
+                            verified = (
+                                final_row == source_row
+                                and final_report == report
+                                and final_messages == messages
+                            )
+                    if not verified:
+                        _quarantine_resume_sidecar(sidecar_path, sid)
+                        raise RuntimeError(
+                            "published sidecar failed post-publish verification"
+                        )
+                s = published
+            except Exception as persist_exc:
+                _discard_resume_staging_file(staging_path)
+                # If publication itself succeeded and only an index/tombstone
+                # side effect failed, reconcile the exact canonical identity as
+                # success. The sidecar was verified before it became visible.
+                try:
+                    recovered = (
+                        _load_resume_sidecar_nonmutating(sidecar_path)
+                        if sidecar_path.exists()
+                        else None
+                    )
+                except Exception:
+                    recovered = None
+                if _same_resume_identity(
+                    recovered,
+                    sid=sid,
+                    profile=profile,
+                    db_path=db_path,
+                    root_id=lineage_root_id,
+                    tip_id=lineage_tip_id,
+                ) and list(getattr(recovered, "messages", []) or []) == messages:
+                    s = recovered
+                    recovered_after_publish_error = True
+                else:
+                    raise persist_exc
+        except Exception as exc:
+            logger.exception("Failed to persist Resume in WebUI sidecar")
+            return bad(handler, _sanitize_error(exc), 500)
+    finally:
+        release_session_claim(sid)
     assert s is not None
     _publish_session_list_changed(
         "session_resume_in_webui_reconciled" if recovered_after_publish_error else "session_resume_in_webui",

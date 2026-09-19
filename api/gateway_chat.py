@@ -822,7 +822,15 @@ def _run_gateway_runs_api_streaming(
 
 
 def _gateway_profile_for_run(run_id: str) -> str | None:
-    """Resolve a run from its atomically published stream/profile binding."""
+    """Resolve a run from its atomically published stream/profile binding.
+
+    Returns the bound profile string — which MAY legitimately be the empty
+    string for an explicitly bound owner/default run — or ``None`` when there is
+    no unique ready binding. Callers must distinguish ``None`` (unowned, fail
+    closed without any outbound call) from ``""`` (owned by the unscoped owner
+    route), otherwise a valid empty-profile binding is mistaken for missing
+    ownership (D5).
+    """
     with _STREAM_RUN_STARTING_CONDITION:
         matches = [
             state
@@ -834,15 +842,19 @@ def _gateway_profile_for_run(run_id: str) -> str | None:
         state = matches[0] or {}
         if str(state.get("phase") or "").strip().lower() != "ready":
             return None
-        profile = str(state.get("profile") or "").strip()
-        return profile or None
+        return str(state.get("profile") or "").strip()
 
 
 def _stop_gateway_run_at_profile(run_id: str, profile: str) -> bool:
-    """Stop an exact binding captured from the stream lifecycle."""
+    """Stop an exact binding captured from the stream lifecycle.
+
+    An empty *profile* is a valid owner representation: it routes to the
+    unscoped owner URL (``/v1/runs/<id>/stop``) rather than the multiplexed
+    ``/p/<profile>`` prefix. Only a missing run id fails closed here.
+    """
     run_id = str(run_id or "").strip()
     profile = str(profile or "").strip()
-    if not run_id or not profile:
+    if not run_id:
         return False
     from api.config import get_config
 
@@ -874,9 +886,14 @@ def _stop_gateway_run_at_profile(run_id: str, profile: str) -> bool:
 
 
 def stop_gateway_run(run_id: str) -> bool:
-    """Stop a uniquely owned run; ambiguous or unowned ids fail closed."""
+    """Stop a uniquely owned run; ambiguous or unowned ids fail closed.
+
+    ``None`` means no unique ready binding (unowned — fail closed with no
+    outbound call). An explicit empty profile is a valid owner binding and is
+    routed to the unscoped owner URL, never silently treated as unowned.
+    """
     profile = _gateway_profile_for_run(run_id)
-    if not profile:
+    if profile is None:
         logger.warning("Refusing unscoped Gateway stop for unowned run %s", run_id)
         return False
     return _stop_gateway_run_at_profile(run_id, profile)

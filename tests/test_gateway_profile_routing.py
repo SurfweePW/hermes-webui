@@ -78,3 +78,75 @@ def test_stop_gateway_run_fails_closed_on_colliding_run_id():
     finally:
         for stream_id in streams:
             _clear_gateway_run_starting(stream_id)
+
+
+def _run_stop_with_bound_profile(stream_id, run_id, profile):
+    """Mark+publish a binding and return the recorded outbound stop request."""
+    _mark_gateway_run_starting(stream_id, profile=profile)
+    _publish_gateway_run_id(stream_id, run_id)
+    response = MagicMock()
+    response.status = 202
+    response.code = 202
+    response.geturl.return_value = (
+        f"http://127.0.0.1:8642"
+        f"{'' if not profile else '/p/' + profile}"
+        f"/v1/runs/{run_id}/stop"
+    )
+    response.__enter__.return_value = response
+    response.__exit__.return_value = None
+    opener = MagicMock()
+    opener.open.return_value = response
+    try:
+        with patch("urllib.request.build_opener", return_value=opener), patch(
+            "api.gateway_chat._gateway_api_key", return_value="secret"
+        ):
+            result = stop_gateway_run(run_id)
+    finally:
+        _clear_gateway_run_starting(stream_id)
+    return result, opener, response
+
+
+def test_stop_gateway_run_treats_bound_empty_profile_as_owned_owner_route():
+    """D5: a bound empty profile is the unscoped owner route, not 'unowned'.
+
+    The audit probe showed ``stop_gateway_run`` collapsing a bound profile ``''``
+    to ``None`` and making no outbound call. It must instead call the unscoped
+    owner URL exactly once.
+    """
+    result, opener, _ = _run_stop_with_bound_profile(
+        "stream-empty-profile-stop", "run-empty-profile", ""
+    )
+
+    assert result is True
+    opener.open.assert_called_once()
+    request = opener.open.call_args.args[0]
+    assert request.full_url == (
+        "http://127.0.0.1:8642/v1/runs/run-empty-profile/stop"
+    )
+    assert request.get_header("Authorization") == "Bearer secret"
+
+
+def test_stop_gateway_run_keeps_default_prefix_for_explicit_default_profile():
+    """An explicit ``'default'`` binding still targets ``/p/default``."""
+    result, opener, _ = _run_stop_with_bound_profile(
+        "stream-default-profile-stop", "run-default-profile", "default"
+    )
+
+    assert result is True
+    opener.open.assert_called_once()
+    request = opener.open.call_args.args[0]
+    assert request.full_url == (
+        "http://127.0.0.1:8642/p/default/v1/runs/run-default-profile/stop"
+    )
+
+
+def test_stop_gateway_run_still_fails_closed_for_pending_empty_profile():
+    """A non-ready empty-profile binding is still unowned: no outbound call."""
+    stream_id = "stream-pending-empty-profile"
+    _mark_gateway_run_starting(stream_id, profile="")
+    try:
+        with patch("urllib.request.build_opener") as build_opener:
+            assert stop_gateway_run("run-pending-empty") is False
+        build_opener.assert_not_called()
+    finally:
+        _clear_gateway_run_starting(stream_id)

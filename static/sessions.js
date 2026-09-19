@@ -2670,9 +2670,22 @@ function _sessionResumeInWebUiProfile(session){
 }
 
 function _sessionResumeInWebUiLabel(session){
-  const title = String((session && (session.title || session.name)) || '').replace(/\s+/g, ' ').trim() || 'Untitled';
-  const sid = _truncatedSessionId(session && session.session_id);
-  return sid ? `${title} (${sid})` : title;
+  // D6: the confirmation names the session by its human title only. The owning
+  // profile is supplied separately by the message, and no internal session
+  // identifier is shown to the user.
+  return String((session && (session.title || session.name)) || '').replace(/\s+/g, ' ').trim() || 'Untitled';
+}
+
+// D6: map a server-side Resume failure to localized, jargon-free copy. Route
+// names, env vars and lineage field names must never surface in the toast; the
+// raw server text is kept in the console detail only.
+function _resumeInWebUiErrorMessage(err){
+  const raw = String((err && err.message) || '').toLowerCase();
+  if(raw.includes('confirm')) return t('session_resume_in_webui_confirm_required');
+  if(raw.includes('disable') || raw.includes('not allowed') || raw.includes('active profile')) return t('session_resume_in_webui_not_allowed');
+  if(raw.includes('lineage') || raw.includes('source session') || raw.includes('source store') || raw.includes('not found')) return t('session_resume_in_webui_source_changed');
+  if(raw.includes('already owns') || raw.includes('does not match') || raw.includes('in flight')) return t('session_resume_in_webui_conflict');
+  return t('session_resume_in_webui_failed');
 }
 
 // Replace the matching cached sidebar row with the server's resumed projection
@@ -2748,11 +2761,13 @@ async function resumeSessionInWebUi(session){
     showToast(t('session_resume_in_webui_resumed'));
     return true;
   }catch(err){
-    // A failed resume materialises nothing server-side, so the session stays
-    // read-only and the row keeps its state; surface a concise error and let the
-    // user retry instead of forcing a full reload.
-    const detail = (err && err.message) ? err.message : String(err || '');
-    showToast(t('session_resume_in_webui_failed') + detail, 6000, 'error');
+    // A failed resume materialises nothing user-visible, so the session stays
+    // read-only and the row keeps its state; surface concise, localized copy and
+    // let the user retry instead of forcing a full reload. D6: the raw server
+    // text (which may contain internal identifiers) is logged as technical
+    // detail, never appended to the toast.
+    console.warn('resume_in_webui failed', err);
+    showToast(_resumeInWebUiErrorMessage(err), 6000, 'error');
     return false;
   }
 }
