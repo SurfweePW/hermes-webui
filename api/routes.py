@@ -31,7 +31,7 @@ import http.client
 import socket as _socket
 from collections import defaultdict, deque, OrderedDict
 from pathlib import Path
-from contextlib import closing
+from contextlib import closing, nullcontext
 from urllib.parse import parse_qs, quote, unquote, urljoin, urlsplit
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, ProxyHandler, Request, build_opener
@@ -10607,7 +10607,8 @@ from api.models import (
     load_projects,
     save_projects,
     import_cli_session,
-    _SESSION_FILE_WRITE_LOCK,
+    stage_session_sidecar,
+    publish_staged_session_sidecar,
     CLAUDE_CODE_SOURCE,
     get_cli_sessions,
     get_cli_session_messages,
@@ -14693,6 +14694,9 @@ def handle_get(handler, parsed) -> bool:
             structured_gateway, run_id = wait_for_gateway_run_id(stream_id, GATEWAY_RUN_ID_WAIT_TIMEOUT)
             if not run_id and structured_gateway:
                 gateway_stop_blocked = True
+            # F3: stop_gateway_run owns the atomic profile binding and fails
+            # closed when the owning profile is unknown or ambiguous, so a stop
+            # can never silently degrade to an unscoped (wrong-profile) endpoint.
             if run_id:
                 if stop_gateway_run(run_id):
                     owner_sid = stream_owner_session_id(stream_id)
@@ -23459,7 +23463,7 @@ def _start_regeneration_stream_locked(
             from api.gateway_chat import _mark_gateway_run_starting
 
             gateway_starting = True
-            _mark_gateway_run_starting(stream_id)
+            _mark_gateway_run_starting(stream_id, profile=getattr(s, "profile", None))
 
         diag.stage("worker_thread_start") if diag else None
         worker_thread = threading.Thread(target=_gated_worker, daemon=True)
@@ -23823,7 +23827,7 @@ def _start_chat_stream_for_session(
         worker_kwargs["moa_config"] = moa_config
     if backend_is_gateway:
         from api.gateway_chat import _mark_gateway_run_starting
-        _mark_gateway_run_starting(stream_id)
+        _mark_gateway_run_starting(stream_id, profile=getattr(s, "profile", None))
     thr = threading.Thread(
         target=worker_target,
         args=(s.session_id, msg, model, workspace, stream_id, attachments),
@@ -26884,9 +26888,33 @@ def _relay_gateway_run_approval(
                 enable_yolo=enable_yolo,
             )
 
-        approval_session = get_session(sid)
+        # Resolve the owning gateway profile without ever letting a missing or
+        # unscoped binding abort an otherwise valid relay. The mirror's immutable
+        # binding is authoritative when present; the session sidecar corroborates
+        # it. F1: a lost/absent session must not raise here. An unscoped binding
+        # falls back to the multiplexed default route rather than silently
+        # relaying against a profile-less base URL.
+        mirror_profile = str(current_mirror.get("_gateway_profile") or "").strip()
+        try:
+            approval_session = get_session(sid)
+        except KeyError:
+            approval_session = None
+        raw_profile = getattr(approval_session, "profile", None)
+        session_profile = raw_profile.strip() if isinstance(raw_profile, str) else ""
+        # A current sidecar may corroborate the mirror binding, but it can never
+        # invent or override ownership. Reject only an explicit mismatch.
+        if mirror_profile and session_profile and mirror_profile != session_profile:
+            return _gateway_approval_failure(
+                sid,
+                choice,
+                code="gateway_run_unavailable",
+                error=_GATEWAY_APPROVAL_RELAY_UNAVAILABLE,
+                status=409,
+                enable_yolo=enable_yolo,
+            )
+        gateway_profile = mirror_profile or session_profile or "default"
         base_url = _gateway_base_url_for_profile(
-            getattr(approval_session, "profile", None),
+            gateway_profile,
             _get_config(),
         )
         api_key = _gateway_api_key()
@@ -29333,12 +29361,100 @@ def _same_resume_identity(session, *, profile: str, db_path: Path, root_id: str,
     )
 
 
-def _read_source_session_row(db_path: Path, sid: str) -> dict | None:
+def _resume_existing_sidecar_conflict(
+    session,
+    *,
+    profile: str,
+    db_path: Path,
+    root_id: str,
+    tip_id: str,
+) -> str | None:
+    """Return the 409 message when *session* blocks this resume, else ``None``.
+
+    ``None`` means the sidecar already owns exactly this resume identity, so the
+    request is an idempotent re-resume. Shared by the pre-flight ownership check
+    and by the post-claim reconciliation of a lost exclusive publication race,
+    so both paths classify an existing sidecar identically.
+    """
+    existing_profile = getattr(session, "profile", None)
+    # The WebUI sidecar store is a single flat directory; the same session id
+    # can collide across profiles. Refuse a blank or foreign-profile sidecar
+    # rather than silently overwriting another profile's session.
+    if not str(existing_profile or "").strip() or not _profiles_match(existing_profile, profile):
+        return "a different WebUI session already owns this session id"
+    stored_identity = (
+        getattr(session, "resume_source_profile", None),
+        getattr(session, "resume_source_state_db", None),
+        getattr(session, "resume_lineage_root_id", None),
+        getattr(session, "resume_lineage_tip_id", None),
+    )
+    if bool(getattr(session, "read_only", False)) or stored_identity != (
+        profile,
+        str(db_path),
+        root_id,
+        tip_id,
+    ):
+        return "an existing WebUI sidecar does not match this resume identity"
+    return None
+
+
+def _discard_resume_staging_file(staging_path: Path) -> None:
+    """Best-effort removal of a Resume staging file that never got published."""
+    try:
+        Path(staging_path).unlink(missing_ok=True)
+    except Exception:
+        logger.warning(
+            "Failed to remove Resume in WebUI staging file %s",
+            staging_path,
+            exc_info=True,
+        )
+
+
+def _quarantine_resume_sidecar(sidecar_path: Path, sid: str) -> Path | None:
+    """Move an unverifiable published resume sidecar out of the live namespace.
+
+    A post-publish read-back that fails to reproduce the verified resume
+    identity means the canonical artifact on disk cannot be trusted. Move it
+    into ``.resume-quarantine`` (never deleted outright) so an operator can
+    inspect it, and reconcile the sidebar index so it is not advertised. The
+    caller raises regardless once the live artifact is gone.
+    """
+    sidecar_path = Path(sidecar_path)
+    quarantine_dir = sidecar_path.parent / ".resume-quarantine"
+    target: Path | None = None
+    try:
+        quarantine_dir.mkdir(parents=True, exist_ok=True)
+        target = quarantine_dir / f"{sid}-{uuid.uuid4().hex}.json"
+        if sidecar_path.exists():
+            os.replace(sidecar_path, target)
+        else:
+            target = None
+    except Exception:
+        logger.exception("Failed to quarantine untrusted resume sidecar %s", sidecar_path)
+        target = None
+    try:
+        _write_session_index()
+    except Exception:
+        logger.debug("Failed to reconcile session index after resume quarantine", exc_info=True)
+    return target
+
+
+def _read_source_session_row(
+    db_path: Path,
+    sid: str,
+    *,
+    connection: sqlite3.Connection | None = None,
+) -> dict | None:
     """Return the source ``sessions`` row for *sid* via a strict read-only open.
 
     Returns ``None`` when the row is absent or the schema is missing ``id``.
     """
-    with closing(_open_source_state_db_readonly(db_path)) as conn:
+    connection_context = (
+        closing(_open_source_state_db_readonly(db_path))
+        if connection is None
+        else nullcontext(connection)
+    )
+    with connection_context as conn:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
         cur.execute("PRAGMA table_info(sessions)")
@@ -29357,7 +29473,34 @@ def _read_source_session_row(db_path: Path, sid: str) -> dict | None:
             (sid,),
         )
         row = cur.fetchone()
-        return dict(row) if row else None
+        return dict(row) if row is not None else None
+
+
+def _read_resume_source_snapshot(db_path: Path, sid: str, profile: str):
+    """Read row, lineage and transcript from one explicit SQLite snapshot."""
+    with closing(_open_source_state_db_readonly(db_path)) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("BEGIN")
+        try:
+            source_row = _read_source_session_row(db_path, sid, connection=conn)
+            report = read_session_lineage_report(
+                db_path,
+                sid,
+                strict_read_only=True,
+                raise_on_error=True,
+                connection=conn,
+            )
+            messages = get_state_db_session_messages(
+                sid,
+                profile=profile,
+                state_db_path=db_path,
+                strict_read_only=True,
+                raise_on_error=True,
+                connection=conn,
+            )
+            return source_row, report, messages
+        finally:
+            conn.rollback()
 
 
 def _handle_session_resume_in_webui(handler, body):
@@ -29422,7 +29565,7 @@ def _handle_session_resume_in_webui(handler, body):
         return bad(handler, "Session not found in source store", 404)
 
     try:
-        source_row = _read_source_session_row(db_path, sid)
+        source_row, report, messages = _read_resume_source_snapshot(db_path, sid, profile)
     except (OSError, sqlite3.Error) as exc:
         logger.exception("Failed to read source store for Resume in WebUI")
         return bad(handler, _sanitize_error(exc), 500)
@@ -29471,16 +29614,6 @@ def _handle_session_resume_in_webui(handler, body):
 
     # Lineage must match the client's exact root + tip so a stale sidebar entry
     # cannot resume a session whose continuation chain moved under it.
-    try:
-        report = read_session_lineage_report(
-            db_path,
-            sid,
-            strict_read_only=True,
-            raise_on_error=True,
-        )
-    except (OSError, sqlite3.Error) as exc:
-        logger.exception("Failed to read source lineage for Resume in WebUI")
-        return bad(handler, _sanitize_error(exc), 500)
     if not report.get("found"):
         return bad(handler, "Session not found in source store", 404)
     if report.get("manual_review"):
@@ -29493,30 +29626,15 @@ def _handle_session_resume_in_webui(handler, body):
         return bad(handler, "lineage does not match the client's root/tip", 409)
 
     if existing is not None:
-        existing_profile = getattr(existing, "profile", None)
-        # The WebUI sidecar store is a single flat directory; the same session
-        # id can collide across profiles. Refuse a blank or foreign-profile
-        # sidecar rather than silently overwriting another profile's session.
-        if not str(existing_profile or "").strip() or not _profiles_match(existing_profile, profile):
-            return bad(handler, "a different WebUI session already owns this session id", 409)
-        expected_identity = (
-            profile,
-            str(db_path),
-            lineage_root_id,
-            lineage_tip_id,
+        conflict = _resume_existing_sidecar_conflict(
+            existing,
+            profile=profile,
+            db_path=db_path,
+            root_id=lineage_root_id,
+            tip_id=lineage_tip_id,
         )
-        stored_identity = (
-            getattr(existing, "resume_source_profile", None),
-            getattr(existing, "resume_source_state_db", None),
-            getattr(existing, "resume_lineage_root_id", None),
-            getattr(existing, "resume_lineage_tip_id", None),
-        )
-        if bool(getattr(existing, "read_only", False)) or stored_identity != expected_identity:
-            return bad(
-                handler,
-                "an existing WebUI sidecar does not match this resume identity",
-                409,
-            )
+        if conflict:
+            return bad(handler, conflict, 409)
         return j(
             handler,
             {
@@ -29534,31 +29652,46 @@ def _handle_session_resume_in_webui(handler, body):
         )
 
     from api.agent_sessions import SOURCE_LABELS
-    try:
-        messages = get_state_db_session_messages(
-            sid,
-            profile=profile,
-            state_db_path=db_path,
-            strict_read_only=True,
-            raise_on_error=True,
-        )
-    except (OSError, sqlite3.Error) as exc:
-        logger.exception("Failed to read source messages for Resume in WebUI")
-        return bad(handler, _sanitize_error(exc), 500)
     title = str(source_row.get("title") or "").strip() or title_from(messages, "Resumed session")
     model = str(source_row.get("model") or "").strip() or "unknown"
     created_at = source_row.get("started_at")
     updated_at = source_row.get("ended_at") or source_row.get("started_at")
 
+    recovered_after_publish_error = False
+    idempotent_after_race = False
+    staging_path = (
+        SESSION_DIR
+        / ".resume-staging"
+        / f"{sid}.{uuid.uuid4().hex}.json"
+    )
     try:
-        with _SESSION_FILE_WRITE_LOCK:
-            # Re-check under the lock used by every Session.save(). This makes
-            # sidecar ownership check + first complete write one serialized
-            # operation, while Session.save() rejects later profile/identity
-            # overwrites.
-            if sidecar_path.exists():
-                return bad(handler, "a WebUI sidecar claimed this session id; refresh and retry", 409)
-            s = import_cli_session(
+        # #765: no writer lock is taken anywhere on this path. Ordinary saves
+        # must stay free to race on their own ``.tmp.<pid>.<tid>`` files, so
+        # first publication is claimed atomically by
+        # ``publish_staged_session_sidecar`` (an exclusive ``os.link`` whose
+        # FileExistsError is reconciled below) instead of being serialized by
+        # ``session_file_write_lock``.
+        # Re-open one fresh read snapshot at the publication boundary. The
+        # first snapshot proves internal consistency; this second read
+        # detects any source-row, lineage, or transcript change that landed
+        # while the request was validating policy and sidecar ownership.
+        current_row, current_report, current_messages = _read_resume_source_snapshot(
+            db_path,
+            sid,
+            profile,
+        )
+        if (
+            current_row != source_row
+            or current_report != report
+            or current_messages != messages
+        ):
+            return bad(
+                handler,
+                "source session changed while Resume in WebUI was validating; refresh and retry",
+                409,
+            )
+        try:
+            candidate = import_cli_session(
                 sid,
                 title,
                 messages,
@@ -29576,30 +29709,116 @@ def _handle_session_resume_in_webui(handler, body):
                 resume_source_state_db=str(db_path),
                 resume_lineage_root_id=lineage_root_id,
                 resume_lineage_tip_id=lineage_tip_id,
+                persist=False,
             )
-            persisted = _load_resume_sidecar_nonmutating(sidecar_path)
-            if not _same_resume_identity(
-                persisted,
+            staged = stage_session_sidecar(candidate, staging_path)
+            if (
+                not _same_resume_identity(
+                    staged,
+                    profile=profile,
+                    db_path=db_path,
+                    root_id=lineage_root_id,
+                    tip_id=lineage_tip_id,
+                )
+                or list(getattr(staged, "messages", []) or []) != messages
+                or bool(getattr(staged, "read_only", True))
+            ):
+                raise RuntimeError("staged sidecar failed resume verification")
+            try:
+                # The canonical path does not exist until this exclusive atomic
+                # claim. Readers can observe either no writable sidecar or the
+                # fully serialized, verified payload — never a partially written
+                # or unverified window — and the claim is all-or-nothing against
+                # a concurrent Resume request or a concurrent Session.save().
+                publish_staged_session_sidecar(staged, staging_path)
+            except FileExistsError:
+                # Another writer won the claim for this id. Re-resolve the
+                # winner: the exact same resume identity is an idempotent
+                # re-resume, anything else is an ownership conflict.
+                try:
+                    published = _load_resume_sidecar_nonmutating(sidecar_path)
+                except Exception:
+                    _discard_resume_staging_file(staging_path)
+                    return bad(
+                        handler,
+                        "an unreadable WebUI sidecar already owns this session id",
+                        409,
+                    )
+                conflict = _resume_existing_sidecar_conflict(
+                    published,
+                    profile=profile,
+                    db_path=db_path,
+                    root_id=lineage_root_id,
+                    tip_id=lineage_tip_id,
+                )
+                _discard_resume_staging_file(staging_path)
+                if conflict:
+                    return bad(handler, conflict, 409)
+                idempotent_after_race = True
+            else:
+                # Post-publish read-back: the canonical sidecar that is now
+                # visible must round-trip to the exact verified identity we
+                # measured. A mismatch means the artifact on disk cannot be
+                # trusted; quarantine it instead of serving it.
+                published = _load_resume_sidecar_nonmutating(sidecar_path)
+                if (
+                    not _same_resume_identity(
+                        published,
+                        profile=profile,
+                        db_path=db_path,
+                        root_id=lineage_root_id,
+                        tip_id=lineage_tip_id,
+                    )
+                    or list(getattr(published, "messages", []) or []) != messages
+                ):
+                    _quarantine_resume_sidecar(sidecar_path, sid)
+                    raise RuntimeError(
+                        "published sidecar failed post-publish verification"
+                    )
+            s = published
+        except Exception as persist_exc:
+            _discard_resume_staging_file(staging_path)
+            # If publication itself succeeded and only an index/tombstone
+            # side effect failed, reconcile the exact canonical identity as
+            # success. The sidecar was verified before it became visible.
+            try:
+                recovered = (
+                    _load_resume_sidecar_nonmutating(sidecar_path)
+                    if sidecar_path.exists()
+                    else None
+                )
+            except Exception:
+                recovered = None
+            if _same_resume_identity(
+                recovered,
                 profile=profile,
                 db_path=db_path,
                 root_id=lineage_root_id,
                 tip_id=lineage_tip_id,
-            ):
-                raise RuntimeError("persisted sidecar failed resume identity verification")
+            ) and list(getattr(recovered, "messages", []) or []) == messages:
+                s = recovered
+                recovered_after_publish_error = True
+            else:
+                raise persist_exc
     except Exception as exc:
         logger.exception("Failed to persist Resume in WebUI sidecar")
         return bad(handler, _sanitize_error(exc), 500)
-    publish_session_list_changed("session_resume_in_webui", profile=profile)
+    assert s is not None
+    _publish_session_list_changed(
+        "session_resume_in_webui_reconciled" if recovered_after_publish_error else "session_resume_in_webui",
+        profile=profile,
+        session_id=sid,
+    )
     return j(
         handler,
         {
             "ok": True,
-            "resumed": True,
-            "idempotent": False,
+            "resumed": not idempotent_after_race,
+            "idempotent": idempotent_after_race,
             "session": public_session_projection(
                 s.compact()
                 | {
-                    "messages": messages,
+                    "messages": list(getattr(s, "messages", None) or messages),
                     "is_cli_session": True,
                 }
             ),

@@ -283,7 +283,11 @@ class TestIssue765FollowupHardening:
         The key regression guard here is that each save call should reach os.replace()
         with a distinct source tmp path. With the old shared `<sid>.tmp` scheme, both
         threads would target the same path and the second replace would deterministically
-        fail once the first consume/remove happened.
+        fail once the first consume/remove happened. Saves must stay lock-free (#765):
+        a process-wide *or per-session* write lock would serialize the two calls and
+        break this contract, which is why Resume-in-WebUI instead claims its first
+        publication with an exclusive atomic link (see
+        ``publish_staged_session_sidecar``).
         """
         s = _make_session("same_sid")
         s.save(skip_index=True)  # seed the file on disk
@@ -321,6 +325,59 @@ class TestIssue765FollowupHardening:
         )
         data = json.loads(s.path.read_text(encoding="utf-8"))
         assert data["session_id"] == "same_sid"
+
+    def test_distinct_sessions_do_not_serialize_on_one_write_lock(self, monkeypatch):
+        """Unrelated sessions must never share one write lock (#765).
+
+        The pre-fix module-global ``_SESSION_FILE_WRITE_LOCK`` serialized every
+        save in the process, so one slow fsync stalled every conversation. Saves
+        must stay fully lock-free: session B has to reach ``os.replace`` while
+        session A is parked inside its own.
+        """
+        a = _make_session("lock_independent_a")
+        b = _make_session("lock_independent_b")
+        a.save(skip_index=True)
+        b.save(skip_index=True)
+
+        original_replace = models.os.replace
+        first_replace_entered = threading.Event()
+        release_first_replace = threading.Event()
+        second_replace_entered = threading.Event()
+        order = []
+        errors = []
+
+        def _replace_with_gate(src, dst):
+            order.append(str(dst))
+            if len(order) == 1:
+                first_replace_entered.set()
+                assert release_first_replace.wait(timeout=5)
+            else:
+                second_replace_entered.set()
+            return original_replace(src, dst)
+
+        monkeypatch.setattr(models.os, "replace", _replace_with_gate)
+
+        def _save_worker(session):
+            try:
+                session.save(skip_index=True)
+            except Exception as e:  # pragma: no cover - failure is asserted below
+                errors.append(e)
+
+        t1 = threading.Thread(target=_save_worker, args=(a,), daemon=True)
+        t2 = threading.Thread(target=_save_worker, args=(b,), daemon=True)
+        t1.start()
+        assert first_replace_entered.wait(timeout=5)
+        t2.start()
+        # Session B must not wait behind session A's per-session lock.
+        assert second_replace_entered.wait(timeout=5), (
+            "unrelated session save was blocked by another session's write lock"
+        )
+        release_first_replace.set()
+        t1.join(timeout=5)
+        t2.join(timeout=5)
+        assert not t1.is_alive()
+        assert not t2.is_alive()
+        assert not errors, f"Concurrent distinct-session saves should not fail: {errors}"
 
     def test_success_path_joins_checkpoint_before_session_mutation(self):
         """Static guard: success path must stop/join checkpoint thread before mutating.

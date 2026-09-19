@@ -4,7 +4,7 @@ import logging
 import os
 import sqlite3
 import sys
-from contextlib import closing
+from contextlib import closing, nullcontext
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from urllib.parse import quote, quote_from_bytes
 
@@ -949,6 +949,7 @@ def read_session_lineage_report(
     *,
     strict_read_only: bool = False,
     raise_on_error: bool = False,
+    connection: sqlite3.Connection | None = None,
 ) -> dict:
     """Return a bounded, read-only lifecycle report for a session lineage.
 
@@ -962,11 +963,16 @@ def read_session_lineage_report(
     if not sid:
         return _empty_lineage_report('')
     db_path = Path(db_path)
-    if not db_path.exists():
+    if connection is None and not db_path.exists():
         return _empty_lineage_report(sid)
 
     try:
-        with closing(open_state_db_readonly(db_path)) as conn:
+        connection_context = (
+            closing(open_state_db_readonly(db_path))
+            if connection is None
+            else nullcontext(connection)
+        )
+        with connection_context as conn:
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
             cur.execute("PRAGMA table_info(sessions)")

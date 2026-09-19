@@ -1,12 +1,13 @@
 """Regression tests for profile-scoped WebUI -> Gateway routing."""
 from __future__ import annotations
 
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from api.gateway_chat import (
-    _STREAM_RUN_IDS,
+    _clear_gateway_run_starting,
     _gateway_base_url_for_profile,
+    _mark_gateway_run_starting,
+    _publish_gateway_run_id,
     stop_gateway_run,
 )
 
@@ -30,7 +31,8 @@ def test_gateway_profile_url_preserves_owner_route_without_profile():
 
 def test_stop_gateway_run_targets_owning_profile():
     stream_id = "stream-profile-stop"
-    _STREAM_RUN_IDS[stream_id] = "run-stop"
+    _mark_gateway_run_starting(stream_id, profile="mentor")
+    _publish_gateway_run_id(stream_id, "run-stop")
     response = MagicMock()
     response.status = 202
     response.code = 202
@@ -45,17 +47,34 @@ def test_stop_gateway_run_targets_owning_profile():
     try:
         with patch("urllib.request.build_opener", return_value=opener), patch(
             "api.gateway_chat._gateway_api_key", return_value="secret"
-        ), patch(
-            "api.gateway_chat.stream_owner_session_id", return_value="session-profile-stop"
-        ), patch(
-            "api.gateway_chat.get_session", return_value=SimpleNamespace(profile="mentor")
         ):
             assert stop_gateway_run("run-stop") is True
     finally:
-        _STREAM_RUN_IDS.pop(stream_id, None)
+        _clear_gateway_run_starting(stream_id)
 
     request = opener.open.call_args.args[0]
     assert request.full_url == (
         "http://127.0.0.1:8642/p/mentor/v1/runs/run-stop/stop"
     )
     assert request.get_header("Authorization") == "Bearer secret"
+
+
+def test_stop_gateway_run_fails_closed_without_atomic_profile_binding():
+    with patch("urllib.request.build_opener") as build_opener:
+        assert stop_gateway_run("unowned-run") is False
+    build_opener.assert_not_called()
+
+
+def test_stop_gateway_run_fails_closed_on_colliding_run_id():
+    streams = ("stream-collision-a", "stream-collision-b")
+    _mark_gateway_run_starting(streams[0], profile="atlas")
+    _mark_gateway_run_starting(streams[1], profile="mentor")
+    _publish_gateway_run_id(streams[0], "colliding-run")
+    _publish_gateway_run_id(streams[1], "colliding-run")
+    try:
+        with patch("urllib.request.build_opener") as build_opener:
+            assert stop_gateway_run("colliding-run") is False
+        build_opener.assert_not_called()
+    finally:
+        for stream_id in streams:
+            _clear_gateway_run_starting(stream_id)

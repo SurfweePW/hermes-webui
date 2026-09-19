@@ -1405,7 +1405,10 @@ async function send(){
     return;
   }
   if(typeof _isReadOnlySession==='function'&&_isReadOnlySession(S.session)){
-    if(typeof showToast==='function') showToast('Resume in WebUI before sending',2600);
+    const _resumeKey='session_resume_in_webui_required';
+    const _resumeTranslated=typeof t==='function'?t(_resumeKey):'';
+    const _resumeMessage=_resumeTranslated&&_resumeTranslated!==_resumeKey?_resumeTranslated:'Resume in WebUI before sending';
+    if(typeof showToast==='function') showToast(_resumeMessage,2600);
     return;
   }
   _sendInProgress = true;

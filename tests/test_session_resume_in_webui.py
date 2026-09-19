@@ -24,6 +24,7 @@ import hashlib
 import io
 import json
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -510,6 +511,91 @@ def test_happy_path_materialises_writable_sidecar_and_leaves_source_untouched(re
     assert _sha256(db) == before
 
 
+def test_resume_source_snapshot_reuses_one_explicit_connection(resume_env, monkeypatch):
+    env = resume_env
+    sid = "snapshot-one-connection"
+    db_path = _alpha_db(env)
+    _make_state_db(db_path, sid=sid)
+
+    routes = env["routes"]
+    seen_connections = []
+    real_row = routes._read_source_session_row
+    real_lineage = routes.read_session_lineage_report
+    real_messages = routes.get_state_db_session_messages
+
+    def capture_row(*args, **kwargs):
+        seen_connections.append(kwargs.get("connection"))
+        return real_row(*args, **kwargs)
+
+    def capture_lineage(*args, **kwargs):
+        seen_connections.append(kwargs.get("connection"))
+        return real_lineage(*args, **kwargs)
+
+    def capture_messages(*args, **kwargs):
+        seen_connections.append(kwargs.get("connection"))
+        return real_messages(*args, **kwargs)
+
+    monkeypatch.setattr(routes, "_read_source_session_row", capture_row)
+    monkeypatch.setattr(routes, "read_session_lineage_report", capture_lineage)
+    monkeypatch.setattr(routes, "get_state_db_session_messages", capture_messages)
+
+    source_row, report, messages = routes._read_resume_source_snapshot(db_path, sid, "alpha")
+
+    assert source_row["id"] == sid
+    assert report["tip_session_id"] == sid
+    assert messages
+    assert seen_connections[0] is not None
+    assert all(conn is seen_connections[0] for conn in seen_connections)
+
+
+def test_source_change_before_publication_is_rejected(resume_env, monkeypatch):
+    env = resume_env
+    sid = "source-changed-before-publish"
+    db_path = _alpha_db(env)
+    _make_state_db(db_path, sid=sid)
+    routes = env["routes"]
+    real_snapshot = routes._read_resume_source_snapshot
+    calls = 0
+
+    def mutate_before_second_snapshot(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            with sqlite3.connect(str(db_path)) as conn:
+                conn.execute(
+                    "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?,?,?,?)",
+                    (sid, "assistant", "late write", 1700000200.0),
+                )
+                conn.execute(
+                    "UPDATE sessions SET message_count = message_count + 1 WHERE id = ?",
+                    (sid,),
+                )
+        return real_snapshot(*args, **kwargs)
+
+    monkeypatch.setattr(routes, "_read_resume_source_snapshot", mutate_before_second_snapshot)
+    routes._handle_session_resume_in_webui(env["rec"], _body(sid=sid))
+
+    assert env["rec"].status == 409
+    assert "changed" in env["rec"].error()
+    assert not (env["sessions_dir"] / f"{sid}.json").exists()
+
+
+def test_failed_post_publish_verification_quarantines_new_sidecar(resume_env, monkeypatch):
+    env = resume_env
+    sid = "post-publish-verification-failure"
+    _make_state_db(_alpha_db(env), sid=sid)
+    routes = env["routes"]
+
+    monkeypatch.setattr(routes, "_load_resume_sidecar_nonmutating", lambda _path: object())
+    routes._handle_session_resume_in_webui(env["rec"], _body(sid=sid))
+
+    sidecar = env["sessions_dir"] / f"{sid}.json"
+    quarantined = list((env["sessions_dir"] / ".resume-quarantine").glob(f"{sid}-*.json"))
+    assert env["rec"].status == 500
+    assert not sidecar.exists()
+    assert len(quarantined) == 1
+
+
 def test_happy_path_rejects_confirm_false_leaves_no_sidecar(resume_env):
     sid = "sess-alpha-1"
     _make_state_db(_alpha_db(resume_env), sid=sid)
@@ -786,3 +872,274 @@ def test_endpoint_reachable_through_handle_post(resume_env, monkeypatch):
     assert env["rec"].status == 200, env["rec"].error()
     assert env["rec"].payload()["resumed"] is True
     assert (env["sessions_dir"] / f"{sid}.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# Atomic first publication (#765 follow-up: no writer lock, exclusive claim)
+# ---------------------------------------------------------------------------
+
+
+def _install_thread_recorders(routes, monkeypatch):
+    """Route ``j``/``bad`` to the *calling thread's* recorder.
+
+    The shared ``resume_env`` recorder cannot observe two concurrent requests,
+    so concurrency tests give each worker its own ``_Recorder`` via a
+    thread-local. The worker must assign ``local.rec`` before calling.
+    """
+    local = threading.local()
+
+    def fake_bad(_handler, msg, status=400):
+        local.rec.bad = (msg, status)
+        return None
+
+    def fake_j(_handler, payload, status=200, extra_headers=None, *, pretty=True):
+        local.rec.j = (payload, status)
+        return None
+
+    monkeypatch.setattr(routes, "bad", fake_bad)
+    monkeypatch.setattr(routes, "j", fake_j)
+    return local
+
+
+def test_first_publication_claims_the_sidecar_with_an_exclusive_link(resume_env, monkeypatch):
+    """First publication must be an exclusive claim, never a clobbering rename."""
+    sid = "sess-exclusive-claim"
+    _make_state_db(_alpha_db(resume_env), sid=sid, messages=3)
+    env = resume_env
+    models = env["models"]
+    sidecar = env["sessions_dir"] / f"{sid}.json"
+
+    links = []
+    replaces = []
+    real_link = models.os.link
+    real_replace = models.os.replace
+
+    def recording_link(src, dst):
+        links.append((str(src), str(dst)))
+        return real_link(src, dst)
+
+    def recording_replace(src, dst):
+        replaces.append((str(src), str(dst)))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(models.os, "link", recording_link)
+    monkeypatch.setattr(models.os, "replace", recording_replace)
+
+    env["routes"]._handle_session_resume_in_webui(env["rec"], _body(sid=sid))
+
+    assert env["rec"].status == 200, env["rec"].error()
+    # Exactly one claim, from the private staging namespace onto the canonical id.
+    assert [dst for _src, dst in links] == [str(sidecar)]
+    staging_src = Path(links[0][0])
+    assert staging_src.parent == env["sessions_dir"] / ".resume-staging"
+    assert staging_src.name.startswith(f"{sid}.")
+    # The canonical path is never created or overwritten by a rename: that would
+    # be the check-then-replace race the exclusive claim replaces.
+    assert not [dst for _src, dst in replaces if dst == str(sidecar)]
+    # The staged artifact is consumed by the claim, not left behind.
+    assert not list((env["sessions_dir"] / ".resume-staging").glob("*.json"))
+    data = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert data["session_id"] == sid
+    assert len(data["messages"]) == 3
+    assert data["resume_source_profile"] == "alpha"
+
+
+def test_readers_never_observe_a_partial_canonical_sidecar(resume_env, monkeypatch):
+    """The canonical id stays invisible until the verified payload lands."""
+    sid = "sess-atomic-visibility"
+    _make_state_db(_alpha_db(resume_env), sid=sid, messages=3)
+    env = resume_env
+    models = env["models"]
+    routes = env["routes"]
+    sidecar = env["sessions_dir"] / f"{sid}.json"
+
+    entered = threading.Event()
+    release = threading.Event()
+    observations = []
+    real_link = models.os.link
+
+    def gated_link(src, dst):
+        observations.append(
+            {
+                "canonical_visible_before_claim": Path(dst).exists(),
+                "staged_payload": json.loads(Path(src).read_text(encoding="utf-8")),
+            }
+        )
+        entered.set()
+        assert release.wait(timeout=5)
+        return real_link(src, dst)
+
+    monkeypatch.setattr(models.os, "link", gated_link)
+
+    worker = threading.Thread(
+        target=routes._handle_session_resume_in_webui,
+        args=(env["rec"], _body(sid=sid)),
+        daemon=True,
+    )
+    worker.start()
+    assert entered.wait(timeout=5)
+    try:
+        # Parked at the claim: a concurrent reader still sees no writable sidecar
+        # at the canonical path (the staged file lives only in the private
+        # namespace), so a partially published artifact can never be observed.
+        assert not sidecar.exists()
+        assert models.Session.load(sid) is None
+        assert observations[0]["canonical_visible_before_claim"] is False
+        # The payload that is about to become visible is already complete.
+        assert observations[0]["staged_payload"]["session_id"] == sid
+        assert len(observations[0]["staged_payload"]["messages"]) == 3
+    finally:
+        release.set()
+    worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert env["rec"].status == 200, env["rec"].error()
+    data = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert data["session_id"] == sid
+    assert len(data["messages"]) == 3
+
+
+def test_concurrent_resume_requests_publish_exactly_one_sidecar(resume_env, monkeypatch):
+    """Two simultaneous Resumes must publish once and stay free of writer locks."""
+    sid = "sess-concurrent-resume"
+    _make_state_db(_alpha_db(resume_env), sid=sid, messages=3)
+    env = resume_env
+    routes = env["routes"]
+    sidecar = env["sessions_dir"] / f"{sid}.json"
+
+    barrier = threading.Barrier(2)
+    real_stage = routes.stage_session_sidecar
+
+    def gated_stage(session, staging_path):
+        staged = real_stage(session, staging_path)
+        # Both requests reach the publication boundary together, so the
+        # exclusive claim is the only thing that can pick the winner.
+        barrier.wait(timeout=5)
+        return staged
+
+    monkeypatch.setattr(routes, "stage_session_sidecar", gated_stage)
+    local = _install_thread_recorders(routes, monkeypatch)
+
+    results = {}
+    errors = []
+
+    def worker(name):
+        local.rec = _Recorder()
+        try:
+            routes._handle_session_resume_in_webui(local.rec, _body(sid=sid))
+        except Exception as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+        results[name] = local.rec
+
+    t1 = threading.Thread(target=worker, args=("a",), daemon=True)
+    t2 = threading.Thread(target=worker, args=("b",), daemon=True)
+    t1.start()
+    t2.start()
+    t1.join(timeout=10)
+    t2.join(timeout=10)
+
+    assert not t1.is_alive() and not t2.is_alive()
+    assert not errors, errors
+    assert sorted(rec.status for rec in results.values()) == [200, 200], [
+        rec.error() for rec in results.values()
+    ]
+    payloads = [rec.payload() for rec in results.values()]
+    # Exactly one request publishes; the other reconciles against the winner's
+    # identical identity as an idempotent success instead of failing.
+    assert sum(1 for payload in payloads if payload["resumed"] is True) == 1
+    assert sum(1 for payload in payloads if payload["idempotent"] is True) == 1
+
+    data = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert data["session_id"] == sid
+    assert len(data["messages"]) == 3
+    assert not list((env["sessions_dir"] / ".resume-staging").glob("*.json"))
+    quarantine = env["sessions_dir"] / ".resume-quarantine"
+    assert not quarantine.exists() or not list(quarantine.glob("*.json"))
+
+
+def test_parked_resume_publication_does_not_stall_unrelated_saves(resume_env, monkeypatch):
+    """A Resume mid-claim must not block saves of other conversations (#765 F2)."""
+    sid = "sess-parked-claim"
+    _make_state_db(_alpha_db(resume_env), sid=sid, messages=3)
+    env = resume_env
+    models = env["models"]
+    routes = env["routes"]
+
+    entered = threading.Event()
+    release = threading.Event()
+    real_link = models.os.link
+
+    def gated_link(src, dst):
+        entered.set()
+        assert release.wait(timeout=5)
+        return real_link(src, dst)
+
+    monkeypatch.setattr(models.os, "link", gated_link)
+
+    worker = threading.Thread(
+        target=routes._handle_session_resume_in_webui,
+        args=(env["rec"], _body(sid=sid)),
+        daemon=True,
+    )
+    worker.start()
+    assert entered.wait(timeout=5)
+
+    unrelated = models.Session(
+        session_id="sess-unrelated-save",
+        title="Unrelated",
+        profile="alpha",
+        messages=[{"role": "user", "content": "hello"}],
+    )
+    replaced = threading.Event()
+    real_replace = models.os.replace
+
+    def recording_replace(src, dst):
+        if str(dst).endswith("sess-unrelated-save.json"):
+            replaced.set()
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(models.os, "replace", recording_replace)
+    saver = threading.Thread(target=unrelated.save, kwargs={"skip_index": True}, daemon=True)
+    saver.start()
+    try:
+        # The unrelated save must complete while the Resume claim is parked:
+        # nothing on the Resume path may serialize unrelated writers.
+        assert replaced.wait(timeout=5), (
+            "an unrelated session save was blocked by a parked Resume publication"
+        )
+    finally:
+        release.set()
+    saver.join(timeout=5)
+    worker.join(timeout=5)
+
+    assert not saver.is_alive()
+    assert env["rec"].status == 200, env["rec"].error()
+
+
+def test_publish_refuses_to_clobber_an_occupied_id(resume_env):
+    """An occupied canonical id is never overwritten by a lost claim."""
+    sid = "sess-occupied-claim"
+    _make_state_db(_alpha_db(resume_env), sid=sid)
+    env = resume_env
+    models = env["models"]
+    sidecar = env["sessions_dir"] / f"{sid}.json"
+    sidecar.write_text('{"session_id": "occupied"}\n', encoding="utf-8")
+
+    candidate = models.import_cli_session(
+        sid,
+        "staged candidate",
+        [{"role": "user", "content": "hello"}],
+        "test-model",
+        profile="alpha",
+        persist=False,
+    )
+    staging = env["sessions_dir"] / ".resume-staging" / f"{sid}.stage.json"
+    staged = models.stage_session_sidecar(candidate, staging)
+
+    with pytest.raises(FileExistsError):
+        models.publish_staged_session_sidecar(staged, staging)
+
+    assert sidecar.read_text(encoding="utf-8") == '{"session_id": "occupied"}\n'
+    # A lost claim leaves the staging file for the caller to clean up; nothing
+    # was published and nothing was destroyed.
+    assert staging.exists()

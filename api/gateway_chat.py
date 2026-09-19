@@ -31,7 +31,6 @@ from api.config import (
     gateway_supports_approval,
     peek_stream,
     register_active_run,
-    stream_owner_session_id,
     unregister_active_run,
     unregister_stream_owner,
     update_active_run,
@@ -49,12 +48,13 @@ _STREAM_RUN_STARTING_CONDITION = threading.Condition()
 GATEWAY_RUN_ID_WAIT_TIMEOUT = 5.0
 
 
-def _mark_gateway_run_starting(stream_id: str) -> None:
+def _mark_gateway_run_starting(stream_id: str, *, profile: str | None = None) -> None:
     with _STREAM_RUN_STARTING_CONDITION:
         _STREAM_RUN_IDS.pop(stream_id, None)
         _STREAM_RUN_LIFECYCLE[stream_id] = {
             "phase": "pending",
             "run_id": "",
+            "profile": str(profile or "").strip(),
             "waiters": 0,
             "owner_done": False,
         }
@@ -67,6 +67,7 @@ def _publish_gateway_run_id(stream_id: str, run_id: str) -> None:
         _STREAM_RUN_LIFECYCLE[stream_id] = {
             "phase": "ready",
             "run_id": run_id,
+            "profile": str(state.get("profile") or "").strip(),
             "waiters": int(state.get("waiters") or 0),
             "owner_done": bool(state.get("owner_done")),
         }
@@ -82,6 +83,7 @@ def _finish_gateway_run_starting(stream_id: str, *, result: str = "failed") -> N
         _STREAM_RUN_LIFECYCLE[stream_id] = {
             "phase": "fallback" if result == "fallback" else "failed",
             "run_id": "",
+            "profile": str(state.get("profile") or "").strip(),
             "waiters": int(state.get("waiters") or 0),
             "owner_done": bool(state.get("owner_done")),
         }
@@ -115,7 +117,11 @@ def gateway_run_id_pending(stream_id: str) -> bool:
         return str((_STREAM_RUN_LIFECYCLE.get(stream_id) or {}).get("phase") or "").strip().lower() == "pending"
 
 
-def wait_for_gateway_run_id(stream_id: str, timeout: float) -> tuple[bool, str | None]:
+def wait_for_gateway_run_binding(
+    stream_id: str,
+    timeout: float,
+) -> tuple[bool, str | None, str | None]:
+    """Wait for and return one immutable ``(run_id, profile)`` binding."""
     deadline = time.monotonic() + max(0.0, float(timeout))
     with _STREAM_RUN_STARTING_CONDITION:
         state = _STREAM_RUN_LIFECYCLE.get(stream_id)
@@ -126,20 +132,22 @@ def wait_for_gateway_run_id(stream_id: str, timeout: float) -> tuple[bool, str |
                 state = _STREAM_RUN_LIFECYCLE.get(stream_id)
                 phase = str((state or {}).get("phase") or "").strip().lower()
                 if phase == "fallback":
-                    return False, None
+                    return False, None, None
                 if phase == "failed":
-                    return True, None
+                    return True, None, None
                 run_id = str(_STREAM_RUN_IDS.get(stream_id) or "").strip()
                 if phase == "ready":
                     stored_run_id = str((state or {}).get("run_id") or "").strip()
-                    return True, run_id or stored_run_id or None
+                    profile = str((state or {}).get("profile") or "").strip()
+                    return True, run_id or stored_run_id or None, profile or None
                 if run_id:
-                    return True, run_id
+                    profile = str((state or {}).get("profile") or "").strip()
+                    return True, run_id, profile or None
                 if not state:
-                    return False, None
+                    return False, None, None
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    return True, None
+                    return True, None, None
                 _STREAM_RUN_STARTING_CONDITION.wait(timeout=remaining)
         finally:
             state = _STREAM_RUN_LIFECYCLE.get(stream_id)
@@ -148,6 +156,11 @@ def wait_for_gateway_run_id(stream_id: str, timeout: float) -> tuple[bool, str |
                 state["waiters"] = waiters
                 if _retire_gateway_run_starting_if_done(stream_id):
                     _STREAM_RUN_STARTING_CONDITION.notify_all()
+
+
+def wait_for_gateway_run_id(stream_id: str, timeout: float) -> tuple[bool, str | None]:
+    structured, run_id, _profile = wait_for_gateway_run_binding(stream_id, timeout)
+    return structured, run_id
 
 _WEBUI_CHAT_BACKEND_ENV = "HERMES_WEBUI_CHAT_BACKEND"
 _WEBUI_GATEWAY_BASE_URL_ENV = "HERMES_WEBUI_GATEWAY_BASE_URL"
@@ -360,6 +373,8 @@ def _settle_gateway_run_approval(
     approval_data: dict,
     base_url: str,
     api_key: str,
+    *,
+    profile: str | None = None,
 ) -> tuple[bool, dict | None, int]:
     """Auto-approve or mirror one run approval at a session-linearized point."""
     from api.route_approvals import gateway_yolo_handoff, submit_gateway_pending_mirror
@@ -384,6 +399,8 @@ def _settle_gateway_run_approval(
                     run_id,
                     exc_info=True,
                 )
+        approval_data = dict(approval_data)
+        approval_data["_gateway_profile"] = str(profile or "").strip()
         head, total = submit_gateway_pending_mirror(session_id, approval_data)
         return False, head, total
 
@@ -707,6 +724,7 @@ def _run_gateway_runs_api_streaming(
                         approval_data,
                         base_url,
                         api_key,
+                        profile=getattr(session, "profile", None),
                     )
                     if auto_approved:
                         sse_event = "message"
@@ -804,27 +822,32 @@ def _run_gateway_runs_api_streaming(
 
 
 def _gateway_profile_for_run(run_id: str) -> str | None:
-    """Resolve a gateway run to the profile that owns its WebUI stream."""
-    for stream_id, mapped_run_id in tuple(_STREAM_RUN_IDS.items()):
-        if str(mapped_run_id or "") != str(run_id or ""):
-            continue
-        owner_sid = stream_owner_session_id(stream_id)
-        owner_session = get_session(owner_sid) if owner_sid else None
-        profile = getattr(owner_session, "profile", None)
-        if isinstance(profile, str) and profile.strip():
-            return profile.strip()
-    return None
+    """Resolve a run from its atomically published stream/profile binding."""
+    with _STREAM_RUN_STARTING_CONDITION:
+        matches = [
+            state
+            for state in tuple(_STREAM_RUN_LIFECYCLE.values())
+            if str((state or {}).get("run_id") or "").strip() == str(run_id or "").strip()
+        ]
+        if len(matches) != 1:
+            return None
+        state = matches[0] or {}
+        if str(state.get("phase") or "").strip().lower() != "ready":
+            return None
+        profile = str(state.get("profile") or "").strip()
+        return profile or None
 
 
-def stop_gateway_run(run_id: str) -> bool:
-    """Request gateway interruption and report whether it was acknowledged."""
+def _stop_gateway_run_at_profile(run_id: str, profile: str) -> bool:
+    """Stop an exact binding captured from the stream lifecycle."""
     run_id = str(run_id or "").strip()
-    if not run_id:
+    profile = str(profile or "").strip()
+    if not run_id or not profile:
         return False
     from api.config import get_config
 
     cfg = get_config()
-    base_url = _gateway_base_url_for_profile(_gateway_profile_for_run(run_id), cfg)
+    base_url = _gateway_base_url_for_profile(profile, cfg)
     api_key = _gateway_api_key()
     headers = {"Accept": "application/json", "Content-Type": "application/json"}
     if api_key:
@@ -848,6 +871,15 @@ def stop_gateway_run(run_id: str) -> bool:
     except (urllib.error.HTTPError, urllib.error.URLError, OSError, ValueError):
         logger.debug("Gateway stop failed for run %s", run_id, exc_info=True)
         return False
+
+
+def stop_gateway_run(run_id: str) -> bool:
+    """Stop a uniquely owned run; ambiguous or unowned ids fail closed."""
+    profile = _gateway_profile_for_run(run_id)
+    if not profile:
+        logger.warning("Refusing unscoped Gateway stop for unowned run %s", run_id)
+        return False
+    return _stop_gateway_run_at_profile(run_id, profile)
 
 
 def _settle_gateway_terminal_error(session_id, stream_id, workspace, model, model_provider, terminal_error):
@@ -1218,7 +1250,10 @@ def _run_gateway_chat_streaming(
                             # No-op when the payload omits run_id.
                             _approval_run_id = str(approval_data.get("run_id") or "").strip()
                             if _approval_run_id:
-                                _STREAM_RUN_IDS[stream_id] = _approval_run_id
+                                _publish_gateway_run_id(stream_id, _approval_run_id)
+                            approval_data["_gateway_profile"] = str(
+                                getattr(s, "profile", None) or ""
+                            ).strip()
                             try:
                                 from api.route_approvals import submit_gateway_pending_mirror
                                 head, total = submit_gateway_pending_mirror(session_id, approval_data)

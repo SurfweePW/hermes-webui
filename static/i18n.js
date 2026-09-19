@@ -547,6 +547,7 @@ const LOCALES = {
     session_resume_in_webui_failed: 'Could not resume in WebUI: ',
     session_resume_in_webui_lineage_unavailable: 'Could not resume: no readable lineage report for this session.',
     session_resume_in_webui_profile_mismatch: 'Could not resume: profile "{0}" is not the active profile.',
+    session_resume_in_webui_required: 'Resume in WebUI before sending',
     session_link_copied: 'Conversation link copied to clipboard',
     session_link_copy_failed: 'Failed to copy conversation link: ',
     share_session: 'Share',

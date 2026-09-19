@@ -13,7 +13,7 @@ import re
 import threading
 import time
 import uuid
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, overload
@@ -1268,7 +1268,13 @@ def _strip_sidebar_heavy_metadata(row: dict) -> dict:
     return row
 
 
-_SESSION_FILE_WRITE_LOCK = threading.RLock()
+# NOTE (#765): there is deliberately no process-wide or per-session write lock
+# around ``Session.save()``. Concurrent saves of one session race safely on
+# distinct ``.tmp.<pid>.<tid>`` files plus an atomic ``os.replace()``, and one
+# conversation's slow fsync must never stall another's save. First publication
+# of a Resume-in-WebUI sidecar is claimed with an exclusive atomic link instead
+# (see ``publish_staged_session_sidecar``), so no writer lock is required on
+# either side of that handoff.
 
 
 class Session:
@@ -1458,13 +1464,24 @@ class Session:
         return SESSION_DIR / f'{self.session_id}.json'
 
     def save(self, touch_updated_at: bool = True, skip_index: bool = False) -> None:
-        # Serialize the ownership check and atomic replace across every WebUI
-        # writer. Resume-in-WebUI uses the same lock while claiming a missing
-        # sidecar, so an unrelated writer cannot interleave a conflicting save.
-        with _SESSION_FILE_WRITE_LOCK:
-            return self._save_unlocked(touch_updated_at=touch_updated_at, skip_index=skip_index)
+        # #765: saves stay lock-free. Two concurrent saves of the same session
+        # must both reach os.replace() with distinct ``.tmp.<pid>.<tid>`` files,
+        # and one slow fsync must never stall another conversation's save. The
+        # cross-writer guarantees a lock used to provide are enforced on the
+        # artifacts themselves instead: the atomic os.replace() below, the
+        # profile/resume ownership guard in _save_unlocked(), and the exclusive
+        # atomic claim Resume-in-WebUI performs in
+        # ``publish_staged_session_sidecar``.
+        return self._save_unlocked(touch_updated_at=touch_updated_at, skip_index=skip_index)
 
-    def _save_unlocked(self, touch_updated_at: bool = True, skip_index: bool = False) -> None:
+    def _save_unlocked(
+        self,
+        touch_updated_at: bool = True,
+        skip_index: bool = False,
+        *,
+        _target_path=None,
+        _publish_side_effects: bool = True,
+    ) -> None:
         if not is_safe_session_id(self.session_id):
             raise ValueError(f"Unsafe session_id {self.session_id!r}; refusing to write outside session store")
         # ── #1558 P0 guard ──────────────────────────────────────────────
@@ -1556,9 +1573,10 @@ class Session:
         # The recovery path is api/session_recovery.py — at server startup and
         # via /api/session/recover, sessions whose JSON has fewer messages than
         # their .bak get restored automatically.
+        target_path = Path(_target_path) if _target_path is not None else self.path
         try:
-            if self.path.exists():
-                existing_text = self.path.read_text(encoding='utf-8')
+            if target_path.exists():
+                existing_text = target_path.read_text(encoding='utf-8')
                 try:
                     existing = json.loads(existing_text)
                     existing_msg_count = len(existing.get('messages') or [])
@@ -1629,20 +1647,20 @@ class Session:
         except OSError:
             pass
 
-        tmp = self.path.with_suffix(f'.tmp.{os.getpid()}.{threading.current_thread().ident}')
+        tmp = target_path.with_suffix(f'.tmp.{os.getpid()}.{threading.current_thread().ident}')
         try:
             with open(tmp, 'w', encoding='utf-8') as f:
                 f.write(payload)
                 f.flush()
                 os.fsync(f.fileno())
-            _safe_replace(tmp, self.path)
+            _safe_replace(tmp, target_path)
         except Exception:
             try:
                 tmp.unlink(missing_ok=True)
             except Exception:
                 pass
             raise
-        if not skip_index:
+        if _publish_side_effects and not skip_index:
             _write_session_index(updates=[self])
 
         # #4985 belt-and-suspenders self-heal: a successful save with at
@@ -1658,7 +1676,7 @@ class Session:
         # save. The helper's self-healing branch in
         # ``_prune_orphaned_webui_zero_message_sessions`` is the primary
         # fix; this is the belt.
-        if self.messages:
+        if _publish_side_effects and self.messages:
             try:
                 _clear_webui_zero_message_orphan_tombstone(self.session_id)
                 _clear_webui_deleted_session_tombstone(self.session_id)
@@ -6931,6 +6949,80 @@ def is_webhook_session(session_id: str, source_tag: str | None = None) -> bool:
 
 
 
+def stage_session_sidecar(session, staging_path):
+    """Serialize a session outside the public sidecar namespace for verification."""
+    staging_path = Path(staging_path)
+    staging_path.parent.mkdir(parents=True, exist_ok=True)
+    session._save_unlocked(
+        touch_updated_at=True,
+        skip_index=True,
+        _target_path=staging_path,
+        _publish_side_effects=False,
+    )
+    data = json.loads(staging_path.read_text(encoding='utf-8'))
+    data['messages'], _ = _collapse_adjacent_duplicate_partials(data.get('messages'))
+    return Session(**data)
+
+
+def _claim_sidecar_path(staging_path, target_path) -> bool:
+    """Atomically claim *target_path* for the fully written *staging_path*.
+
+    ``os.link`` is the create-if-absent primitive: it either installs the
+    already written + fsync'd staged payload under the canonical name, or fails
+    with ``FileExistsError`` because some other writer (a concurrent Resume
+    request, or a plain ``Session.save()`` for the same id) already owns it.
+    Because the claim is a single filesystem operation there is no
+    check-then-write window, and because no writer lock is involved the #765
+    concurrent-save contract for ordinary saves stays intact.
+
+    Any other ``OSError`` (a filesystem without hard-link support, a cross-device
+    staging directory) propagates: publication fails closed rather than falling
+    back to a non-atomic rename that could expose a partial sidecar.
+    """
+    try:
+        os.link(staging_path, target_path)
+    except FileExistsError:
+        return False
+    return True
+
+
+def publish_staged_session_sidecar(session, staging_path):
+    """Atomically expose one verified staged session under its canonical id.
+
+    First publication is an all-or-nothing exclusive claim: the canonical path
+    either appears with the complete, verified payload or never appears at all,
+    so readers cannot observe a partially written or unverified sidecar. The
+    claim does not take the (removed) global/per-session save lock, so a
+    concurrent ``Session.save()`` for another id is unaffected and the #765
+    concurrent-save guard keeps holding.
+
+    Raises ``FileExistsError`` when the id is already owned. The caller decides
+    whether that owner is an idempotent re-resume or a conflicting session.
+    """
+    staging_path = Path(staging_path)
+    if not _claim_sidecar_path(staging_path, session.path):
+        raise FileExistsError(session.path)
+    try:
+        staging_path.unlink(missing_ok=True)
+    except OSError:
+        logger.debug(
+            "Failed to drop published Resume staging file %s",
+            staging_path,
+            exc_info=True,
+        )
+    _write_session_index(updates=[session])
+    if session.messages:
+        try:
+            _clear_webui_zero_message_orphan_tombstone(session.session_id)
+            _clear_webui_deleted_session_tombstone(session.session_id)
+        except Exception:
+            logger.debug(
+                "Failed to clear webui tombstone for staged session %s",
+                session.session_id,
+                exc_info=True,
+            )
+
+
 def import_cli_session(
     session_id: str,
     title: str,
@@ -6950,6 +7042,7 @@ def import_cli_session(
     resume_source_state_db=None,
     resume_lineage_root_id=None,
     resume_lineage_tip_id=None,
+    persist=True,
 ):
     """Create a new WebUI session populated with CLI/agent messages.
 
@@ -6978,21 +7071,25 @@ def import_cli_session(
         resume_lineage_root_id=resume_lineage_root_id,
         resume_lineage_tip_id=resume_lineage_tip_id,
     )
+    if persist:
+        # Publish the sidecar before clearing tombstones. A failed import must
+        # not alter sidebar visibility when no writable artifact exists.
+        s.save(touch_updated_at=False)
     # #4985: import_cli_session uses an explicit sid (the CLI sidecar's id).
     # If that sid was previously tombstoned as a webui zero-message orphan,
     # clear the tombstone entry so the freshly-imported session is visible
-    # on the next poll. Wrapped because a tombstone failure must never block
-    # an import.
-    try:
-        _clear_webui_zero_message_orphan_tombstone(s.session_id)
-        _clear_webui_deleted_session_tombstone(s.session_id)
-    except Exception:
-        logger.debug(
-            "Failed to clear webui tombstone for %s",
-            s.session_id,
-            exc_info=True,
-        )
-    s.save(touch_updated_at=False)
+    # on the next poll. Wrapped because a tombstone failure must never turn a
+    # successfully published import into an HTTP failure.
+    if persist:
+        try:
+            _clear_webui_zero_message_orphan_tombstone(s.session_id)
+            _clear_webui_deleted_session_tombstone(s.session_id)
+        except Exception:
+            logger.debug(
+                "Failed to clear webui tombstone for %s",
+                s.session_id,
+                exc_info=True,
+            )
     return s
 
 
@@ -8569,6 +8666,7 @@ def get_state_db_session_messages(
     state_db_path=None,
     strict_read_only: bool = False,
     raise_on_error: bool = False,
+    connection=None,
 ) -> list: ...
 
 
@@ -8585,6 +8683,7 @@ def get_state_db_session_messages(
     state_db_path=None,
     strict_read_only: bool = False,
     raise_on_error: bool = False,
+    connection=None,
 ) -> StateDBSessionMessagesSnapshot: ...
 
 
@@ -8600,6 +8699,7 @@ def get_state_db_session_messages(
     state_db_path=None,
     strict_read_only: bool = False,
     raise_on_error: bool = False,
+    connection=None,
 ):
     """Read messages for a Hermes session from state.db.
 
@@ -8649,13 +8749,18 @@ def get_state_db_session_messages(
         db_path = _get_profile_home(profile) / 'state.db'
     else:
         db_path = _active_state_db_path()
-    if not db_path.exists():
+    if connection is None and not db_path.exists():
         if raise_on_error:
             raise FileNotFoundError(f"state.db not found: {db_path}")
         return _state_db_session_messages_result([], None, with_revision=with_revision)
 
     try:
-        with closing(open_state_db_readonly(db_path, strict=strict_read_only)) as conn:
+        connection_context = (
+            closing(open_state_db_readonly(db_path, strict=strict_read_only))
+            if connection is None
+            else nullcontext(connection)
+        )
+        with connection_context as conn:
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
             cur.execute("PRAGMA table_info(messages)")

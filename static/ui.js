@@ -8532,7 +8532,7 @@ function updateSendBtn(){
   let _btnTitle;
   if(action==='disabled'){
     const _dmsg=$('msg');
-    if(typeof _isReadOnlySession==='function'&&_isReadOnlySession(S.session)) _btnTitle='Resume in WebUI before sending';
+    if(typeof _isReadOnlySession==='function'&&_isReadOnlySession(S.session)) _btnTitle=_tt('session_resume_in_webui_required','Resume in WebUI before sending');
     else if(_dmsg&&_dmsg.disabled) _btnTitle=_tt('composer_disabled_clarify','Respond to the clarification request');
     else _btnTitle=_tt('composer_disabled_empty','Type a message to send');
   }else if(action==='queue'&&typeof isCompressionUiRunning==='function'&&isCompressionUiRunning()){
