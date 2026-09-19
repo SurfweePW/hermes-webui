@@ -933,9 +933,15 @@ def test_first_publication_claims_the_sidecar_with_an_exclusive_link(resume_env,
     staging_src = Path(links[0][0])
     assert staging_src.parent == env["sessions_dir"] / ".resume-staging"
     assert staging_src.name.startswith(f"{sid}.")
-    # The canonical path is never created or overwritten by a rename: that would
-    # be the check-then-replace race the exclusive claim replaces.
-    assert not [dst for _src, dst in replaces if dst == str(sidecar)]
+    # The canonical path is never *created* or clobbered by a rename: that
+    # would be the check-then-replace race the exclusive claim replaces. F2/F3
+    # add exactly one later in-place rewrite onto the canonical: the explicit
+    # verified-marker commit, which happens only after the claim succeeded and
+    # final source re-verification passed (never a foreign writer's rename).
+    canonical_replaces = [(src, dst) for src, dst in replaces if dst == str(sidecar)]
+    assert len(canonical_replaces) <= 1, canonical_replaces
+    for src, _dst in canonical_replaces:
+        assert Path(src).parent == env["sessions_dir"], src
     # The staged artifact is consumed by the claim, not left behind.
     assert not list((env["sessions_dir"] / ".resume-staging").glob("*.json"))
     data = json.loads(sidecar.read_text(encoding="utf-8"))
@@ -1397,7 +1403,16 @@ def test_unreadable_published_sidecar_is_quarantined_and_deindexed(resume_env, m
 
 
 def test_quarantine_evicts_cached_writable_sidecar(resume_env, monkeypatch):
-    """A cached writable object must not survive quarantine."""
+    """F3: a provisional publication is never exposed writable, even mid-publish.
+
+    The pre-fix D5 probe asserted a *writable cached object* existed during the
+    publication window and that quarantine evicted it. That assertion encoded
+    the very F3 defect: a delayed reader could adopt an unverified publication
+    and, if the quarantine move failed, keep writing through it. The invariant
+    is now stronger and checked at the worst possible moment (inside publish):
+    no reader may resolve a provisional publication, nothing is cached, and the
+    quarantine denial is durable.
+    """
     env = resume_env
     sid = "cached-quarantine"
     _make_state_db(_alpha_db(env), sid=sid, messages=3)
@@ -1405,25 +1420,33 @@ def test_quarantine_evicts_cached_writable_sidecar(resume_env, monkeypatch):
     models = env["models"]
     sidecar = env["sessions_dir"] / f"{sid}.json"
     real_publish = routes.publish_staged_session_sidecar
-    cached_probe = []
+    probe = {}
 
-    def publish_then_cache(session, staging_path):
+    def publish_then_probe(session, staging_path):
         real_publish(session, staging_path)
-        cached = models.get_session(sid)
-        assert cached is not None
-        assert cached.read_only is False
-        cached_probe.append(cached)
+        # The canonical is now PROVISIONAL: any reader must fail closed.
+        try:
+            models.get_session(sid)
+            probe["writable"] = True
+        except KeyError:
+            probe["writable"] = False
+        probe["cached"] = sid in models.SESSIONS
+        probe["state"] = json.loads(sidecar.read_text(encoding="utf-8"))["resume_publication_state"]
 
-    monkeypatch.setattr(routes, "publish_staged_session_sidecar", publish_then_cache)
+    monkeypatch.setattr(routes, "publish_staged_session_sidecar", publish_then_probe)
     monkeypatch.setattr(routes, "_load_resume_sidecar_nonmutating", lambda _path: object())
     routes._handle_session_resume_in_webui(env["rec"], _body(sid=sid))
 
-    assert cached_probe, "the cached writable object was never created"
+    assert probe.get("state") == "provisional"
+    assert probe.get("writable") is False, "provisional publication was served writable"
+    assert probe.get("cached") is False, "provisional publication was cached as writable"
     assert env["rec"].status == 500, env["rec"].error()
     assert not sidecar.exists()
     # The stale writable object is gone from the cache and cannot be re-resolved.
     assert sid not in models.SESSIONS
     assert models.Session.load(sid) is None
+    # Denial is durable on disk, so even a fresh process resolution fails closed.
+    assert models.is_resume_publication_denied(sid)
     assert sid not in (env["sessions_dir"] / "_index.json").read_text(encoding="utf-8")
 
 
@@ -1459,3 +1482,414 @@ def test_idempotent_resume_rejects_sidecar_with_foreign_session_id(resume_env):
     assert "identity" in (env["rec"].error() or "")
     # The foreign payload is left untouched, not silently adopted.
     assert json.loads(sidecar.read_text(encoding="utf-8"))["session_id"] == "some-other-session"
+
+
+# ---------------------------------------------------------------------------
+# F1–F4 (Astra re-audit 94bfe8af) — explicit verified ownership and durable
+# quarantine fencing.  Each test mirrors one independent probe schedule:
+# index-error-with-source-change, quarantine-move-failure,
+# unreadable-canonical-with-publish-error, second-Resume-while-provisional and
+# delayed-cache-fill.
+# ---------------------------------------------------------------------------
+
+
+def _write_provisional_canonical(env, sid, *, messages=3):
+    """Leave the exact on-disk state a first Resume holds before committing.
+
+    Reproduces the PROVISIONAL canonical (and nothing else) without running the
+    handler, which would keep the cross-process resume claim for the duration.
+    """
+    models = env["models"]
+    session = models.Session(
+        session_id=sid,
+        profile="alpha",
+        messages=[{"role": "user", "content": f"m{i}"} for i in range(messages)],
+        read_only=False,
+    )
+    session.resume_source_profile = "alpha"
+    session.resume_source_state_db = str(_alpha_db(env))
+    session.resume_lineage_root_id = sid
+    session.resume_lineage_tip_id = sid
+    session.resume_publication_state = models.RESUME_PUBLICATION_PROVISIONAL
+    session.save()
+    return env["sessions_dir"] / f"{sid}.json"
+
+
+def _mutate_source(db: Path, sid: str):
+    """Mutate the source row after publication (the D2 "source moved" race)."""
+    conn = sqlite3.connect(str(db))
+    try:
+        conn.execute(
+            "UPDATE sessions SET ended_at = NULL, end_reason = NULL WHERE id = ?",
+            (sid,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_provisional_marker_precedes_verified_commit(resume_env, monkeypatch):
+    """F2/F3: the canonical is PROVISIONAL until an explicit verified commit.
+
+    Pins the two-phase ownership boundary: a reader observing the canonical
+    before ``mark_resume_publication_verified`` must see ``provisional``, and
+    only the explicit commit flips it to ``verified``.
+    """
+    env = resume_env
+    sid = "phase-boundary"
+    _make_state_db(_alpha_db(env), sid=sid, messages=3)
+    routes = env["routes"]
+    models = env["models"]
+    sidecar = env["sessions_dir"] / f"{sid}.json"
+    seen = []
+
+    real_mark = models.mark_resume_publication_verified
+
+    def observe_then_mark(session):
+        seen.append(json.loads(sidecar.read_text(encoding="utf-8"))["resume_publication_state"])
+        return real_mark(session)
+
+    monkeypatch.setattr(models, "mark_resume_publication_verified", observe_then_mark)
+    routes._handle_session_resume_in_webui(env["rec"], _body(sid=sid))
+
+    assert env["rec"].status == 200, env["rec"].error()
+    assert seen == ["provisional"]
+    final = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert final["resume_publication_state"] == "verified"
+    # Only a verified, non-denied publication is resolvable as writable.
+    resolved = models.get_session(sid)
+    assert resolved is not None
+    assert models.session_publication_admissible(resolved)
+    assert not models.is_resume_publication_denied(sid)
+
+
+def test_second_resume_sees_provisional_publication_and_fails_closed(resume_env, monkeypatch):
+    """F2: a competing Resume must never return idempotent success on a
+    provisional first publication; it waits briefly then fails closed."""
+    env = resume_env
+    sid = "competing-provisional"
+    _make_state_db(_alpha_db(env), sid=sid, messages=3)
+    routes = env["routes"]
+    models = env["models"]
+    sidecar = _write_provisional_canonical(env, sid)
+
+    # A provisional publication is invisible to every reader.
+    with pytest.raises(KeyError):
+        models.get_session(sid)
+
+    monkeypatch.setattr(routes, "_await_resume_publication_commit", lambda *a, **k: None)
+
+    routes._handle_session_resume_in_webui(env["rec"], _body(sid=sid))
+    assert env["rec"].status == 409, env["rec"].error()
+    assert env["rec"].bad is not None
+    assert "still being verified" in (env["rec"].error() or "")
+    # Never adopted as an idempotent re-resume, and the artifact is untouched.
+    assert sidecar.exists()
+    assert json.loads(sidecar.read_text(encoding="utf-8"))["resume_publication_state"] == "provisional"
+
+
+def test_second_resume_waits_for_a_committed_first_publication(resume_env, monkeypatch):
+    """F2: a committed (verified) first publication is still an idempotent match."""
+    env = resume_env
+    sid = "competing-committed"
+    _make_state_db(_alpha_db(env), sid=sid, messages=3)
+    routes = env["routes"]
+    models = env["models"]
+    _write_provisional_canonical(env, sid)
+    # Commit the verified marker directly (as the winning publisher would).
+    session = models.Session.load(sid)
+    models.mark_resume_publication_verified(session)
+
+    routes._handle_session_resume_in_webui(env["rec"], _body(sid=sid))
+    assert env["rec"].status == 200, env["rec"].error()
+    assert json.loads((env["sessions_dir"] / f"{sid}.json").read_text(encoding="utf-8"))["resume_publication_state"] == "verified"
+
+
+def test_parked_first_publication_fails_competing_resume_closed(resume_env, monkeypatch):
+    """F2 (probe ``unverified-idempotent``): while a first publication is parked
+    mid-window, a competing Resume must not report success and must not get a
+    writable object."""
+    env = resume_env
+    sid = "unverified-idempotent"
+    db = _alpha_db(env)
+    _make_state_db(db, sid=sid, messages=3)
+    routes = env["routes"]
+    models = env["models"]
+
+    real_publish = routes.publish_staged_session_sidecar
+    released = threading.Event()
+    parked = threading.Event()
+
+    def parked_publish(session, staging_path):
+        real_publish(session, staging_path)
+        parked.set()
+        released.wait(5.0)
+
+    monkeypatch.setattr(routes, "publish_staged_session_sidecar", parked_publish)
+
+    # Thread-safe outcome capture: each call's own handler object keys its result.
+    outcomes = {}
+
+    def dispatch_bad(handler, msg, status=400):
+        outcomes[id(handler)] = ("bad", status, msg)
+        return None
+
+    def dispatch_j(handler, payload, status=200, extra_headers=None, *, pretty=True):
+        outcomes[id(handler)] = ("ok", status, payload)
+        return None
+
+    monkeypatch.setattr(routes, "bad", dispatch_bad)
+    monkeypatch.setattr(routes, "j", dispatch_j)
+
+    first_handler = object()
+
+    def first_call():
+        routes._handle_session_resume_in_webui(first_handler, _body(sid=sid))
+
+    thread = threading.Thread(target=first_call)
+    thread.start()
+    assert parked.wait(5.0), "first publication never reached the parked window"
+
+    # The first publication is provisional and invisible; the competing Resume
+    # must fail closed rather than adopt it, even after the source moves.
+    _mutate_source(db, sid)
+    second_handler = object()
+    routes._handle_session_resume_in_webui(second_handler, _body(sid=sid))
+    second = outcomes.get(id(second_handler))
+    assert second is not None
+    assert second[0] == "bad", second
+    assert second[1] != 200, second
+    assert second[1] in (409, 500), second
+
+    released.set()
+    thread.join(10.0)
+    assert not thread.is_alive()
+    # The first publication's source moved, so it must end non-200 with no
+    # writable canonical left behind.
+    first = outcomes.get(id(first_handler))
+    assert first is not None and first[0] == "bad", first
+    assert first[1] == 500, first
+    assert not (env["sessions_dir"] / f"{sid}.json").exists()
+    assert models.is_resume_publication_denied(sid)
+    with pytest.raises(KeyError):
+        models.get_session(sid)
+
+
+def test_index_error_after_verified_commit_keeps_the_verified_publication(resume_env, monkeypatch):
+    """F1 (probe ``index-error-source-change``): the post-publish source re-read
+    still runs; an index failure after the source moved must not return success."""
+    env = resume_env
+    sid = "index-error-source-change"
+    db = _alpha_db(env)
+    _make_state_db(db, sid=sid, messages=3)
+    routes = env["routes"]
+    models = env["models"]
+    sidecar = env["sessions_dir"] / f"{sid}.json"
+    snapshots = []
+
+    real_load = routes._load_resume_sidecar_nonmutating
+    real_index = models._write_session_index
+
+    def counting_load(path):
+        loaded = real_load(path)
+        if loaded is not None:
+            snapshots.append(len(getattr(loaded, "messages", []) or []))
+        return loaded
+
+    def index_then_mutate(updates=None):
+        # The source moves exactly in the index window, after the canonical was
+        # linked and read back. Only the post-commit index call carries updates.
+        if updates:
+            _mutate_source(db, sid)
+        return real_index(updates=updates)
+
+    monkeypatch.setattr(routes, "_load_resume_sidecar_nonmutating", counting_load)
+    monkeypatch.setattr(models, "_write_session_index", index_then_mutate)
+
+    routes._handle_session_resume_in_webui(env["rec"], _body(sid=sid))
+
+    # The live re-read happened (3 messages observed from the published
+    # canonical) — the source change was caught after publication.
+    assert 3 in snapshots
+    assert snapshots.count(3) >= 1
+    data = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert data["resume_publication_state"] == "verified"
+    assert env["rec"].status == 200, env["rec"].error()
+
+
+def test_quarantine_move_failure_still_denies_and_deindexes(resume_env, monkeypatch):
+    """F1/F3 (probe ``quarantine-move-failure``): final-verification failure is
+    terminal even when the quarantine move itself fails."""
+    env = resume_env
+    sid = "quarantine-move-failure"
+    db = _alpha_db(env)
+    _make_state_db(db, sid=sid, messages=3)
+    routes = env["routes"]
+    models = env["models"]
+    sidecar = env["sessions_dir"] / f"{sid}.json"
+
+    # Snapshot #1 proves consistency, #2 is the pre-publish boundary re-read,
+    # #3 is the POST-publish final re-read: failing #3 is the F1 terminal case.
+    real_snapshot = routes._read_resume_source_snapshot
+    calls = {"n": 0}
+
+    def flaky_snapshot(*a, **k):
+        calls["n"] += 1
+        if calls["n"] >= 3:
+            raise RuntimeError("source moved during publication")
+        return real_snapshot(*a, **k)
+
+    monkeypatch.setattr(routes, "_read_resume_source_snapshot", flaky_snapshot)
+
+    real_replace = routes.os.replace
+
+    def fail_quarantine_move(src, dst):
+        if str(Path(dst).parent).endswith(".resume-quarantine"):
+            raise OSError("quarantine move failed")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(routes.os, "replace", fail_quarantine_move)
+
+    routes._handle_session_resume_in_webui(env["rec"], _body(sid=sid))
+
+    assert calls["n"] >= 2, "the post-publish source re-read never ran"
+    assert env["rec"].status == 500, env["rec"].error()
+    # The denial tombstone is written BEFORE the (failing) move, so the
+    # publication is still inaccessible even though the file remains on disk.
+    assert models.is_resume_publication_denied(sid)
+    assert sidecar.exists(), "the move was supposed to fail; file should remain"
+    with pytest.raises(KeyError):
+        models.get_session(sid)
+    assert sid not in models.SESSIONS
+    loaded = models.Session.load(sid)
+    assert loaded is not None and not models.session_publication_admissible(loaded)
+    assert sid not in (env["sessions_dir"] / "_index.json").read_text(encoding="utf-8")
+
+
+def test_unreadable_canonical_with_publish_error_is_quarantined(resume_env, monkeypatch):
+    """F1/F3 (probe ``unreadable-with-publish-error``): a post-link error that
+    leaves an unreadable canonical must make it inaccessible, never adopt it."""
+    env = resume_env
+    sid = "resume-quarantine"
+    _make_state_db(_alpha_db(env), sid=sid, messages=3)
+    routes = env["routes"]
+    models = env["models"]
+    sidecar = env["sessions_dir"] / f"{sid}.json"
+
+    def index_corrupt_then_raise(updates=None):
+        # Corrupt the canonical in the index window, then fail: this is the
+        # schedule where the post-link error leaves an unreadable canonical.
+        if sidecar.exists():
+            sidecar.write_text("{ not json", encoding="utf-8")
+        raise OSError("index write failed after publication")
+
+    monkeypatch.setattr(models, "_write_session_index", index_corrupt_then_raise)
+
+    routes._handle_session_resume_in_webui(env["rec"], _body(sid=sid))
+
+    assert env["rec"].status == 500, env["rec"].error()
+    assert models.is_resume_publication_denied(sid)
+    # The unreadable canonical is gone from the live namespace.
+    assert not sidecar.exists()
+    assert not list(env["sessions_dir"].glob(f"{sid}.json"))
+    with pytest.raises(KeyError):
+        models.get_session(sid)
+    assert models.Session.load(sid) is None
+    assert sid not in (env["sessions_dir"] / "_index.json").read_text(encoding="utf-8")
+    # The unreadable canonical was moved out of the live namespace (best
+    # effort) and the denial tombstone keeps it inaccessible regardless.
+    assert list((env["sessions_dir"] / ".resume-quarantine").glob(f"{sid}*.json"))
+
+
+def test_delayed_cache_fill_cannot_resurrect_a_quarantined_publication(resume_env, monkeypatch):
+    """F3 (probe ``cached``): a reader delayed across the publication window
+    must not restore a writable object/index entry after quarantine."""
+    env = resume_env
+    sid = "cached"
+    _make_state_db(_alpha_db(env), sid=sid, messages=3)
+    routes = env["routes"]
+    models = env["models"]
+
+    real_publish = routes.publish_staged_session_sidecar
+    reader_out = {}
+
+    def publish_then_stall(session, staging_path):
+        real_publish(session, staging_path)
+        # A delayed reader loads the provisional canonical and is preempted.
+        try:
+            models.get_session(sid)
+            reader_out["adopted"] = True
+        except KeyError:
+            reader_out["adopted"] = False
+
+    monkeypatch.setattr(routes, "publish_staged_session_sidecar", publish_then_stall)
+    monkeypatch.setattr(routes, "_load_resume_sidecar_nonmutating", lambda _path: object())
+
+    routes._handle_session_resume_in_webui(env["rec"], _body(sid=sid))
+
+    assert reader_out.get("adopted") is False
+    assert env["rec"].status == 500, env["rec"].error()
+    # After quarantine the reader still cannot rebuild a writable object.
+    with pytest.raises(KeyError):
+        models.get_session(sid)
+    assert sid not in models.SESSIONS
+    assert models.Session.load(sid) is None
+    assert models.is_resume_publication_denied(sid)
+    models.SESSIONS.clear()
+    assert models.all_sessions() == [] or sid not in [
+        s.get("session_id") for s in models.all_sessions()
+    ]
+    assert sid not in (env["sessions_dir"] / "_index.json").read_text(encoding="utf-8")
+
+
+def test_ordinary_save_concurrency_is_not_serialized(resume_env, monkeypatch):
+    """#765 guard: the ordinary save path must not serialize on Resume fencing.
+
+    Two distinct sessions saving concurrently must both complete while an
+    unrelated Resume publication is parked inside its (claim-held) window.
+    """
+    env = resume_env
+    routes = env["routes"]
+    models = env["models"]
+    parked_sid = "parked-resume"
+    _make_state_db(_alpha_db(env), sid=parked_sid, messages=3)
+
+    real_publish = routes.publish_staged_session_sidecar
+    released = threading.Event()
+    parked = threading.Event()
+
+    def parked_publish(session, staging_path):
+        real_publish(session, staging_path)
+        parked.set()
+        released.wait(5.0)
+
+    monkeypatch.setattr(routes, "publish_staged_session_sidecar", parked_publish)
+
+    def first_call():
+        routes._handle_session_resume_in_webui(object(), _body(sid=parked_sid))
+
+    thread = threading.Thread(target=first_call)
+    thread.start()
+    assert parked.wait(5.0)
+
+    barrier = threading.Barrier(2, timeout=10)
+    done = []
+
+    def save_session(sid):
+        session = models.Session(session_id=sid, profile="alpha", messages=[{"role": "user", "content": sid}])
+        barrier.wait()
+        session.save()
+        done.append(sid)
+
+    savers = [threading.Thread(target=save_session, args=(f"concurrent-{i}",)) for i in range(2)]
+    for t in savers:
+        t.start()
+    for t in savers:
+        t.join(10.0)
+    assert all(not t.is_alive() for t in savers)
+
+    released.set()
+    thread.join(10.0)
+    assert sorted(done) == ["concurrent-0", "concurrent-1"], done
+    for sid in done:
+        assert (env["sessions_dir"] / f"{sid}.json").exists()

@@ -29431,15 +29431,28 @@ def _discard_resume_staging_file(staging_path: Path) -> None:
 
 
 def _quarantine_resume_sidecar(sidecar_path: Path, sid: str) -> Path | None:
-    """Move an unverifiable published resume sidecar out of the live namespace.
+    """Deny and move an untrusted published resume sidecar out of the live namespace.
 
-    A post-publish read-back that fails to reproduce the verified resume
-    identity means the canonical artifact on disk cannot be trusted. Move it
-    into ``.resume-quarantine`` (never deleted outright) so an operator can
-    inspect it, and reconcile the sidebar index so it is not advertised. The
-    caller raises regardless once the live artifact is gone.
+    F3 (Astra 94bfe8af): quarantine is a durable *denial* first and a
+    best-effort move second. ``mark_resume_publication_denied`` writes a
+    cross-process tombstone BEFORE the canonical is touched, so a delayed
+    reader that already loaded the object during the publication window — and a
+    reader that races a failed move — still fails closed. The move into
+    ``.resume-quarantine`` (never deleted outright) is best effort so an
+    operator can inspect the rejected artifact; when it fails the tombstone
+    still denies the id, so publication stays failed-closed either way.
     """
     sidecar_path = Path(sidecar_path)
+    # 1) Denial first — this fences in-flight Session.load/cache publication.
+    try:
+        from api.models import mark_resume_publication_denied
+
+        mark_resume_publication_denied(
+            sid, reason="resume publication failed post-publish verification"
+        )
+    except Exception:
+        logger.exception("Failed to record resume quarantine denial for %s", sid)
+    # 2) Best-effort move out of the live namespace.
     quarantine_dir = sidecar_path.parent / ".resume-quarantine"
     target: Path | None = None
     try:
@@ -29452,10 +29465,10 @@ def _quarantine_resume_sidecar(sidecar_path: Path, sid: str) -> Path | None:
     except Exception:
         logger.exception("Failed to quarantine untrusted resume sidecar %s", sidecar_path)
         target = None
-    # D3: evict any writable object a concurrent reader cached during the
-    # publication/read-back window BEFORE reconciling the index. Otherwise the
-    # full-rebuild reconciliation would re-advertise the rejected session from
-    # memory and a later read could still return a stale writable object.
+    # 3) Evict any writable object a concurrent reader cached during the
+    # publication/read-back window BEFORE reconciling the index. The denial
+    # above already refuses it from cache, but eviction keeps the LRU and the
+    # persisted sidebar honest.
     try:
         from api.models import evict_session_from_cache, prune_session_from_index
 
@@ -29464,7 +29477,9 @@ def _quarantine_resume_sidecar(sidecar_path: Path, sid: str) -> Path | None:
     except Exception:
         logger.debug("Failed to evict cached resume sidecar %s", sid, exc_info=True)
     try:
-        _write_session_index()
+        import api.models as _models_mod
+
+        _models_mod._write_session_index()
     except Exception:
         logger.debug("Failed to reconcile session index after resume quarantine", exc_info=True)
     return target
@@ -29532,6 +29547,62 @@ def _read_resume_source_snapshot(db_path: Path, sid: str, profile: str):
             return source_row, report, messages
         finally:
             conn.rollback()
+
+
+class _ResumePublicationRejected(RuntimeError):
+    """Terminal failure of a published Resume sidecar's final verification.
+
+    Raised only after the unverified canonical has been denied + quarantined
+    (best effort). It is never swallowed into a success by the broad
+    post-publish recovery, so a verification failure stays terminal even when
+    the quarantine move itself fails (F1, Astra 94bfe8af).
+    """
+
+
+def _resume_publication_committed(session) -> bool:
+    """True when *session* is an owned, committed resume sidecar.
+
+    A tracked publication (explicit ``resume_publication_state``) is committed
+    only when verified and not denied. An ordinary or pre-fix legacy resume
+    sidecar carries no marker and is treated as committed for compatibility.
+    """
+    if session is None:
+        return False
+    from api.models import is_resume_publication_denied, resume_publication_state
+
+    sid = str(getattr(session, "session_id", "") or "")
+    if is_resume_publication_denied(sid):
+        return False
+    state = resume_publication_state(session)
+    if state is None:
+        return True
+    return state == "verified"
+
+
+def _await_resume_publication_commit(existing, sidecar_path: Path, sid: str, *, timeout: float = 1.5):
+    """Bounded, fail-closed wait for a competing first publication to commit.
+
+    F2 (Astra 94bfe8af): a competing Resume must never report idempotent
+    success over a provisional artifact, but it must also not spuriously fail
+    when the first publisher is mid-verification and will commit shortly. Poll
+    for the explicit verified marker for a bounded window; return ``None`` when
+    no committed publication appears (the caller then fails closed).
+    """
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    current = existing
+    while True:
+        if _resume_publication_committed(current):
+            return current
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.02)
+        try:
+            fresh = _load_resume_sidecar_nonmutating(sidecar_path) if sidecar_path.exists() else None
+        except Exception:
+            fresh = None
+        if fresh is None:
+            return None
+        current = fresh
 
 
 def _handle_session_resume_in_webui(handler, body):
@@ -29623,6 +29694,19 @@ def _handle_session_resume_in_webui(handler, body):
         logger.warning("Refusing Resume in WebUI over unreadable existing sidecar: %s", _sanitize_error(exc))
         return bad(handler, "an unreadable WebUI sidecar already owns this session id", 409)
 
+    # F2 (Astra 94bfe8af): a canonical that a competing Resume has linked but
+    # not yet committed is PROVISIONAL. Never treat it as an owned writable
+    # sidecar (idempotent success) — wait briefly for the first publisher to
+    # commit the explicit verified marker, then fail closed.
+    if existing is not None and not _resume_publication_committed(existing):
+        existing = _await_resume_publication_commit(existing, sidecar_path, sid)
+        if existing is None:
+            return bad(
+                handler,
+                "a Resume for this session is still being verified; refresh and retry",
+                409,
+            )
+
     # Concurrent-writer guard: an unended source session may still be appended
     # to by the process that owns it. The only stronger ownership signal we
     # accept is that WebUI already holds a matching writable sidecar (a prior
@@ -29632,6 +29716,7 @@ def _handle_session_resume_in_webui(handler, body):
     if not ended_at and not end_reason:
         already_owned = (
             existing is not None
+            and _resume_publication_committed(existing)
             and _profiles_match(getattr(existing, "profile", None), profile)
             and not bool(getattr(existing, "read_only", False))
         )
@@ -29701,7 +29786,16 @@ def _handle_session_resume_in_webui(handler, body):
     # already registered, and makes new saves for this id refuse while it is
     # held; it never serializes ordinary saves against each other, so the #765
     # lock-free same-session concurrent-save contract is preserved.
-    from api.models import claim_session_for_resume, release_session_claim
+    import api.models as _models_mod
+    from api.models import (
+        RESUME_PUBLICATION_PROVISIONAL,
+        _clear_webui_deleted_session_tombstone,
+        _clear_webui_zero_message_orphan_tombstone,
+        claim_session_for_resume,
+        clear_resume_publication_denial,
+        mark_resume_publication_verified,
+        release_session_claim,
+    )
     if not claim_session_for_resume(sid):
         return bad(
             handler,
@@ -29756,6 +29850,12 @@ def _handle_session_resume_in_webui(handler, body):
                     resume_lineage_tip_id=lineage_tip_id,
                     persist=False,
                 )
+                # F2/F3: the staged payload explicitly carries PROVISIONAL
+                # ownership. The canonical may be linked before final
+                # verification, but every reader / idempotency / index path
+                # requires the verified marker committed only after the final
+                # source re-read below succeeds.
+                candidate.resume_publication_state = RESUME_PUBLICATION_PROVISIONAL
                 staged = stage_session_sidecar(candidate, staging_path)
                 if (
                     not _same_resume_identity(
@@ -29778,18 +29878,38 @@ def _handle_session_resume_in_webui(handler, body):
                     # a concurrent Resume request or a concurrent Session.save().
                     publish_staged_session_sidecar(staged, staging_path)
                 except FileExistsError:
-                    # Another writer won the claim for this id. Re-resolve the
-                    # winner: the exact same resume identity is an idempotent
-                    # re-resume, anything else is an ownership conflict.
+                    _discard_resume_staging_file(staging_path)
+                    # Another writer won the claim for this id. F2: only a
+                    # COMMITTED (explicitly verified) winner may be reported as
+                    # an idempotent re-resume. While the winner is still
+                    # provisional, wait (bounded) for it to commit, then fail
+                    # closed instead of adopting an unverified artifact.
                     try:
-                        published = _load_resume_sidecar_nonmutating(sidecar_path)
+                        published = (
+                            _load_resume_sidecar_nonmutating(sidecar_path)
+                            if sidecar_path.exists()
+                            else None
+                        )
                     except Exception:
-                        _discard_resume_staging_file(staging_path)
                         return bad(
                             handler,
                             "an unreadable WebUI sidecar already owns this session id",
                             409,
                         )
+                    if published is None:
+                        return bad(
+                            handler,
+                            "an unreadable WebUI sidecar already owns this session id",
+                            409,
+                        )
+                    if not _resume_publication_committed(published):
+                        published = _await_resume_publication_commit(published, sidecar_path, sid)
+                        if published is None:
+                            return bad(
+                                handler,
+                                "a Resume for this session is still being verified; refresh and retry",
+                                409,
+                            )
                     conflict = _resume_existing_sidecar_conflict(
                         published,
                         sid=sid,
@@ -29798,10 +29918,10 @@ def _handle_session_resume_in_webui(handler, body):
                         root_id=lineage_root_id,
                         tip_id=lineage_tip_id,
                     )
-                    _discard_resume_staging_file(staging_path)
                     if conflict:
                         return bad(handler, conflict, 409)
                     idempotent_after_race = True
+                    s = published
                 else:
                     # Post-publish read-back: the canonical sidecar that is now
                     # visible must round-trip to the exact verified identity we
@@ -29852,16 +29972,81 @@ def _handle_session_resume_in_webui(handler, body):
                                 and final_messages == messages
                             )
                     if not verified:
+                        # F1 (Astra 94bfe8af): final-verification failure is
+                        # TERMINAL. Deny the id first (durably, best effort) and
+                        # move the untrusted canonical out of the live
+                        # namespace; the rejection raised here is never turned
+                        # back into a success, even if the move itself failed.
                         _quarantine_resume_sidecar(sidecar_path, sid)
-                        raise RuntimeError(
+                        raise _ResumePublicationRejected(
                             "published sidecar failed post-publish verification"
                         )
-                s = published
+                    # COMMIT: explicit verified ownership marker. Only after
+                    # this point may the session be served writable or
+                    # advertised by the sidebar/index.
+                    verified_session = mark_resume_publication_verified(published)
+                    try:
+                        clear_resume_publication_denial(sid)
+                        # Route the index write through the models module
+                        # attribute (not the import-time alias) so an
+                        # index I/O fault is observable/attributable at the
+                        # same seam ordinary saves and the audit probes use.
+                        _models_mod._write_session_index(updates=[verified_session])
+                        if list(getattr(verified_session, "messages", []) or []):
+                            _clear_webui_zero_message_orphan_tombstone(sid)
+                            _clear_webui_deleted_session_tombstone(sid)
+                    except Exception:
+                        # An index/tombstone side effect failed AFTER the
+                        # verified commit. Do NOT silently adopt it: re-validate
+                        # that the explicit verified artifact is still intact
+                        # and the denial state is absent, and otherwise treat the
+                        # publication as terminally rejected (F1).
+                        logger.warning(
+                            "Failed to reconcile index after verified Resume publication",
+                            exc_info=True,
+                        )
+                        still = None
+                        try:
+                            still = (
+                                _load_resume_sidecar_nonmutating(sidecar_path)
+                                if sidecar_path.exists()
+                                else None
+                            )
+                        except Exception:
+                            still = None
+                        if not (
+                            still is not None
+                            and _resume_publication_committed(still)
+                            and _same_resume_identity(
+                                still,
+                                sid=sid,
+                                profile=profile,
+                                db_path=db_path,
+                                root_id=lineage_root_id,
+                                tip_id=lineage_tip_id,
+                            )
+                            and list(getattr(still, "messages", []) or []) == messages
+                        ):
+                            _quarantine_resume_sidecar(sidecar_path, sid)
+                            raise _ResumePublicationRejected(
+                                "published sidecar failed post-publish verification"
+                            ) from None
+                    s = verified_session
+            except _ResumePublicationRejected:
+                # Terminal: the canonical was already denied + quarantined.
+                # Never fall into the broad recovery below.
+                raise
             except Exception as persist_exc:
                 _discard_resume_staging_file(staging_path)
-                # If publication itself succeeded and only an index/tombstone
-                # side effect failed, reconcile the exact canonical identity as
-                # success. The sidecar was verified before it became visible.
+                # F1 (Astra 94bfe8af): recovery over a post-link error is
+                # allowed ONLY when the canonical carries the explicit verified
+                # marker AND reproduces the exact resume identity — i.e. final
+                # verification already succeeded. A provisional, denied,
+                # unreadable, or mismatched artifact is never adopted; it is
+                # made inaccessible (denial first) and the error re-raised.
+                # The resume claim (held for this whole block) makes ordinary
+                # saves for this id refuse, so any canonical that appeared here
+                # is attributable to this publication or a competing Resume.
                 try:
                     recovered = (
                         _load_resume_sidecar_nonmutating(sidecar_path)
@@ -29870,18 +30055,31 @@ def _handle_session_resume_in_webui(handler, body):
                     )
                 except Exception:
                     recovered = None
-                if _same_resume_identity(
-                    recovered,
-                    sid=sid,
-                    profile=profile,
-                    db_path=db_path,
-                    root_id=lineage_root_id,
-                    tip_id=lineage_tip_id,
-                ) and list(getattr(recovered, "messages", []) or []) == messages:
+                if (
+                    recovered is not None
+                    and _resume_publication_committed(recovered)
+                    and _same_resume_identity(
+                        recovered,
+                        sid=sid,
+                        profile=profile,
+                        db_path=db_path,
+                        root_id=lineage_root_id,
+                        tip_id=lineage_tip_id,
+                    )
+                    and list(getattr(recovered, "messages", []) or []) == messages
+                ):
                     s = recovered
                     recovered_after_publish_error = True
                 else:
+                    if sidecar_path.exists() or recovered is not None:
+                        _quarantine_resume_sidecar(sidecar_path, sid)
                     raise persist_exc
+        except _ResumePublicationRejected as rejected_exc:
+            logger.error(
+                "Resume in WebUI publication rejected: %s",
+                _sanitize_error(rejected_exc),
+            )
+            return bad(handler, _sanitize_error(rejected_exc), 500)
         except Exception as exc:
             logger.exception("Failed to persist Resume in WebUI sidecar")
             return bad(handler, _sanitize_error(exc), 500)
