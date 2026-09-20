@@ -325,6 +325,142 @@ def evict_session_from_cache(sid) -> None:
 
 
 # ---------------------------------------------------------------------------
+# A2/A3 — Resume publication revocation protocol (Astra 4f0ad5d8)
+# ---------------------------------------------------------------------------
+# A denial must be a *revocation boundary*, not a best-effort eviction. Three
+# holes existed:
+#
+#   * the admissibility predicate ran BEFORE the cache-insertion lock, so a
+#     reader preempted between the two could repopulate ``SESSIONS`` with a
+#     writable object after quarantine (A2);
+#   * a tracked object already returned to a caller stayed writable until a
+#     later ``Session.save()`` recreated the canonical file, because the save
+#     path only consulted the momentary active-claim counter (A2);
+#   * the denial tombstone was consulted only by a batched listing snapshot, so
+#     a marker-absent legacy Resume sidecar stayed visible and re-indexable
+#     (A3).
+#
+# The protocol below gives every id a monotonic revocation *generation*:
+#
+#   * ``admit_session`` records the generation under the authority lock in the
+#     SAME critical section that inserts into the cache. A concurrent
+#     revocation either bumps the generation first (the admission refuses) or
+#     lands after the insertion (its eviction removes the entry).
+#   * ``revoke_resume_publication`` bumps the generation, writes the tombstone
+#     and evicts the cache inside one critical section.
+#   * ``assert_resume_publication_writable`` is the commit fence: a tracked
+#     Resume sidecar's canonical write is refused once the tombstone exists or
+#     the recorded admission generation no longer matches. The per-id lock held
+#     across the write keeps a concurrent revocation from interleaving.
+#
+# None of this touches an ordinary (non-Resume) session: no generation is
+# recorded, no stat is taken, and no lock is acquired, so the #765 lock-free
+# concurrent-save contract for ordinary saves is untouched.
+_RESUME_AUTHORITY_LOCK = threading.RLock()
+_RESUME_SID_LOCKS: dict[str, threading.RLock] = {}
+_RESUME_REVOCATION_GENERATION: dict[str, int] = {}
+
+# Ownership fields that identify a Resume-in-WebUI sidecar, including a pre-fix
+# legacy sidecar that predates the explicit publication marker.
+_RESUME_IDENTITY_FIELDS = (
+    "resume_source_state_db",
+    "resume_lineage_root_id",
+    "resume_lineage_tip_id",
+    "resume_source_profile",
+)
+
+
+def _resume_sid_lock(sid) -> threading.RLock:
+    """Return the stable per-id lock used to fence tracked Resume persistence."""
+    sid = str(sid or "")
+    with _RESUME_AUTHORITY_LOCK:
+        lock = _RESUME_SID_LOCKS.get(sid)
+        if lock is None:
+            lock = threading.RLock()
+            _RESUME_SID_LOCKS[sid] = lock
+        return lock
+
+
+def resume_revocation_generation(sid) -> int:
+    """Return the current revocation generation for *sid* (0 when never denied)."""
+    with _RESUME_AUTHORITY_LOCK:
+        return int(_RESUME_REVOCATION_GENERATION.get(str(sid or ""), 0))
+
+
+def is_tracked_resume_identity(session) -> bool:
+    """True for a marked publication or a legacy (marker-absent) Resume sidecar.
+
+    Ordinary sessions carry neither the explicit publication marker nor any
+    resume ownership field, so every caller keeps its stat-free hot path.
+    """
+    if session is None:
+        return False
+    if resume_publication_state(session) is not None:
+        return True
+    return any(getattr(session, field, None) for field in _RESUME_IDENTITY_FIELDS)
+
+
+def _stamp_resume_admission(session, sid) -> None:
+    """Record the revocation generation under which *session* was admitted."""
+    try:
+        session._resume_admission_generation = resume_revocation_generation(sid)
+    except Exception:  # pragma: no cover - exotic session stand-ins
+        logger.debug("failed to stamp Resume admission generation", exc_info=True)
+
+
+def admit_session(sid, session, *, cache_on_miss=True, promote_cache=True) -> bool:
+    """Validate publication authority and (optionally) cache *session* atomically.
+
+    The admissibility predicate deliberately runs WITHOUT the authority lock so
+    a caller parked inside it can never block a concurrent revocation. Precision
+    comes from re-validating the revocation generation under the authority lock
+    in the same critical section as the cache insertion: either the admission
+    lands first (and the revocation's eviction removes it) or the revocation
+    lands first (and the changed generation refuses it).
+    """
+    sid = str(sid or "")
+    snapshot = resume_revocation_generation(sid)
+    if not session_publication_admissible(session):
+        return False
+    with _RESUME_AUTHORITY_LOCK:
+        if int(_RESUME_REVOCATION_GENERATION.get(sid, 0)) != snapshot:
+            return False
+        if is_resume_publication_denied(sid):
+            return False
+        if cache_on_miss:
+            with LOCK:
+                SESSIONS[sid] = session
+                if promote_cache:
+                    SESSIONS.move_to_end(sid)
+                _evict_sessions_over_cap()  # #4765: safe LRU eviction
+        _stamp_resume_admission(session, sid)
+        return True
+
+
+def assert_resume_publication_writable(session) -> None:
+    """Commit fence for a tracked Resume sidecar's canonical persistence.
+
+    Callers hold the per-id lock across the write, so a concurrent
+    ``revoke_resume_publication`` cannot interleave: it either completed first
+    (the tombstone refuses this write) or waits for the write and then
+    quarantines the artifact out of the live namespace. An ordinary session
+    never reaches this helper.
+    """
+    sid = str(getattr(session, "session_id", "") or "")
+    if is_resume_publication_denied(sid):
+        raise PermissionError(
+            f"session {sid!r} Resume publication is denied; refusing to write"
+        )
+    stamped = getattr(session, "_resume_admission_generation", None)
+    if stamped is None:
+        return
+    if int(stamped) != resume_revocation_generation(sid):
+        raise PermissionError(
+            f"session {sid!r} Resume write authority was revoked after admission"
+        )
+
+
+# ---------------------------------------------------------------------------
 # F2/F3 — explicit Resume publication ownership boundary (Astra 94bfe8af)
 # ---------------------------------------------------------------------------
 # A Resume-in-WebUI first publication is a two-phase, cross-process handoff:
@@ -376,17 +512,12 @@ def is_resume_publication_denied(sid, *, session_dir: Path | None = None) -> boo
         return True
 
 
-def mark_resume_publication_denied(sid, *, reason: str = "", session_dir: Path | None = None) -> None:
-    """Create the durable denial tombstone BEFORE any best-effort quarantine.
+def _write_resume_denial_tombstone(sid, *, reason: str = "", session_dir: Path | None = None) -> None:
+    """Atomically publish the durable denial tombstone for *sid*.
 
-    Must be called before moving/removing the canonical artifact so that a
-    reader that already loaded the object, or a reader that races a failed
-    move, still fails closed. Never raises: a denial that cannot be recorded
-    is logged, and the caller still fails the publication closed.
+    Never raises: a denial that cannot be recorded is logged, and the caller
+    still fails the publication closed.
     """
-    sid = str(sid or "")
-    if not sid:
-        return
     directory = resume_denial_dir(session_dir)
     try:
         directory.mkdir(parents=True, exist_ok=True)
@@ -407,6 +538,48 @@ def mark_resume_publication_denied(sid, *, reason: str = "", session_dir: Path |
         logger.warning("Failed to record Resume quarantine denial for %s", sid, exc_info=True)
 
 
+def mark_resume_publication_denied(sid, *, reason: str = "", session_dir: Path | None = None) -> None:
+    """Create the durable denial tombstone and revoke write authority for *sid*.
+
+    Must be called before moving/removing the canonical artifact so that a
+    reader that already loaded the object, or a reader that races a failed
+    move, still fails closed. The revocation generation is bumped under the
+    authority lock so an admission that already observed the pre-denial
+    generation cannot land afterwards. Never raises.
+    """
+    sid = str(sid or "")
+    if not sid:
+        return
+    with _resume_sid_lock(sid):
+        with _RESUME_AUTHORITY_LOCK:
+            _RESUME_REVOCATION_GENERATION[sid] = (
+                int(_RESUME_REVOCATION_GENERATION.get(sid, 0)) + 1
+            )
+            _write_resume_denial_tombstone(sid, reason=reason, session_dir=session_dir)
+
+
+def revoke_resume_publication(
+    sid, *, reason: str = "", session_dir: Path | None = None
+) -> int:
+    """Durably deny *sid* and atomically revoke any admitted write authority.
+
+    One critical section bumps the revocation generation, writes the tombstone
+    and evicts any cached writable object, so a reader that is concurrently
+    admitting either completes first (and is then evicted) or observes the
+    revocation and refuses. Returns the new generation.
+    """
+    sid = str(sid or "")
+    if not sid:
+        return 0
+    with _resume_sid_lock(sid):
+        with _RESUME_AUTHORITY_LOCK:
+            generation = int(_RESUME_REVOCATION_GENERATION.get(sid, 0)) + 1
+            _RESUME_REVOCATION_GENERATION[sid] = generation
+            _write_resume_denial_tombstone(sid, reason=reason, session_dir=session_dir)
+            evict_session_from_cache(sid)
+    return generation
+
+
 def clear_resume_publication_denial(sid, *, session_dir: Path | None = None) -> None:
     """Remove a denial tombstone for a freshly committed publication."""
     sid = str(sid or "")
@@ -418,19 +591,34 @@ def clear_resume_publication_denial(sid, *, session_dir: Path | None = None) -> 
         logger.debug("Failed to clear Resume quarantine denial for %s", sid, exc_info=True)
 
 
-def _denied_resume_publication_ids(session_dir: Path | None = None) -> frozenset:
+def _denied_resume_publication_ids(session_dir: Path | None = None):
     """One-shot listing of quarantined (denied) Resume publication ids.
 
     Used by sidebar/index enumeration so a denied sid can never be
-    re-presented, without paying a stat per index row.
+    re-presented, without paying a stat per index row. Returns ``None`` when
+    the denial directory cannot be listed: callers must NOT read that as
+    "no denials" (see ``_denied_ids_contains``).
     """
     directory = resume_denial_dir(session_dir)
     try:
         return frozenset(p.stem for p in directory.glob("*.json") if p.is_file())
     except OSError:
-        # Fail closed: if the denial directory is unreadable, keep any ids we
-        # can; callers still re-check admissibility per candidate.
-        return frozenset()
+        # Snapshot unavailable. A3: this must never be treated as affirmative
+        # absence of denial — callers fall back to the fail-closed per-id stat.
+        logger.debug("denied Resume id snapshot unavailable", exc_info=True)
+        return None
+
+
+def _denied_ids_contains(denied_ids, sid) -> bool:
+    """Membership test for a denied-id snapshot, falling back fail-closed.
+
+    When the batched snapshot could not be read, consult the per-id tombstone;
+    ``is_resume_publication_denied`` yourself fails closed on an OSError.
+    """
+    sid = str(sid or "")
+    if denied_ids is None:
+        return is_resume_publication_denied(sid)
+    return sid in denied_ids
 
 
 def resume_publication_state(session) -> str | None:
@@ -445,35 +633,56 @@ def resume_publication_is_verified(session) -> bool:
     return not is_resume_publication_denied(getattr(session, "session_id", ""))
 
 
-def session_publication_admissible(session) -> bool:
+def session_publication_admissible(session, *, denied_resume_ids=None) -> bool:
     """May a loaded object be served as an owned, writable session?
 
     Denial wins over everything: a quarantined id is inadmissible even when a
-    delayed reader still holds the object, or when the quarantine move failed
-    and the canonical file is still on disk. An ordinary session (no marker)
-    or a pre-fix legacy resume sidecar is admissible; a tracked publication is
-    admissible only once explicitly verified.
+    delayed reader still holds the object, even when the quarantine move failed
+    and the canonical file is still on disk, and — since A3 — even for a pre-fix
+    legacy Resume sidecar that predates the explicit publication marker.
+
+    Only a *tracked* Resume identity consults the denial tombstone, so an
+    ordinary session keeps a stat-free hot path. Enumeration callers may pass a
+    validated ``denied_resume_ids`` snapshot to batch the check; ``None`` means
+    the snapshot was unavailable and each tracked identity falls back to the
+    fail-closed per-id stat.
     """
     try:
-        sid = getattr(session, "session_id", "")
+        sid = str(getattr(session, "session_id", "") or "")
         state = resume_publication_state(session)
         if state is None:
-            # Ordinary session, or a pre-fix legacy resume sidecar: it carries
-            # no publication marker, so there is no ownership boundary to
-            # enforce. Checking the tombstone here would cost a stat on every
-            # row of the /api/sessions enumeration, so keep the hot path free
-            # of it (the listing paths additionally consult the one-shot denied
-            # set, which is what catches a legacy id whose move failed).
-            return True
+            # A pre-fix legacy Resume sidecar carries no publication marker but
+            # IS a tracked Resume identity (it owns a foreign source/lineage), so
+            # a denial must still win — for direct lookup, the cache, the
+            # fallback scan, the full rebuild and incremental updates alike.
+            if not is_tracked_resume_identity(session):
+                return True
+            return not _denied_ids_contains(denied_resume_ids, sid)
         if state != RESUME_PUBLICATION_VERIFIED:
             # Provisional (or unknown) publication: never served writable.
             return False
         # A verified publication is still inadmissible once quarantined, even
         # when the best-effort move failed and the canonical is still on disk.
-        return not is_resume_publication_denied(sid)
+        return not _denied_ids_contains(denied_resume_ids, sid)
     except Exception:
         logger.debug("resume publication admissibility check failed", exc_info=True)
         return False
+
+
+def resume_publication_strictly_verified(session) -> bool:
+    """Strict proof predicate for a publication owned by the current attempt.
+
+    Requires the explicit ``resume_publication_state == 'verified'`` marker plus
+    the absence of a denial. A missing, empty, unknown or provisional marker is
+    NEVER accepted as proof (A1). This is deliberately distinct from the legacy
+    existing-sidecar idempotency/migration policy, which must keep accepting a
+    pre-fix sidecar that legitimately predates the marker.
+    """
+    if session is None:
+        return False
+    if resume_publication_state(session) != RESUME_PUBLICATION_VERIFIED:
+        return False
+    return not is_resume_publication_denied(str(getattr(session, "session_id", "") or ""))
 
 
 def mark_resume_publication_verified(session):
@@ -668,13 +877,18 @@ def _write_session_index(updates=None, *, session_dir: Path | None = None, sessi
         # Lazy full-rebuild path — used when index doesn't exist yet.
         if updates is None or not session_index_file.exists():
             _cleanup_stale_tmp_files()  # best-effort sweep on startup / first call
+            # A3: a full rebuild must deny a legacy (marker-absent) Resume
+            # sidecar whose quarantine move failed, not just a marked one. The
+            # denied-id snapshot batches the check; a snapshot that could not
+            # be read falls back to the fail-closed per-id stat.
+            denied_resume_ids = _denied_resume_publication_ids(session_dir)
             entry_map: dict[str, dict] = {}
             for p in session_dir.glob('*.json'):
                 if p.name.startswith('_'):
                     continue
                 try:
                     s = _load_session_from_path(p)
-                    if s and session_publication_admissible(s):
+                    if s and session_publication_admissible(s, denied_resume_ids=denied_resume_ids):
                         c = s.compact()
                         sid = c.get('session_id')
                         if sid:
@@ -696,7 +910,7 @@ def _write_session_index(updates=None, *, session_dir: Path | None = None, sessi
                     s.compact()
                     for s in SESSIONS.values()
                     if s.session_id not in existing_ids
-                    and session_publication_admissible(s)
+                    and session_publication_admissible(s, denied_resume_ids=denied_resume_ids)
                 ]
             entries.extend(in_memory_entries)
             entries.sort(key=lambda s: s.get('updated_at', 0), reverse=True)
@@ -724,6 +938,11 @@ def _write_session_index(updates=None, *, session_dir: Path | None = None, sessi
             # Avoid N filesystem exists() checks under LOCK by collecting
             # on-disk IDs once before entering the critical section.
             on_disk_ids = _persisted_session_ids_snapshot()
+            # A3: an incremental update must (a) never insert a denied tracked
+            # Resume publication and (b) actively drop a denied row already in
+            # the index, including a legacy marker-absent sidecar whose
+            # quarantine move failed.
+            denied_resume_ids = _denied_resume_publication_ids(session_dir)
             existing = json.loads(session_index_file.read_bytes())
             if not isinstance(existing, list):
                 raise ValueError("session index must be a list")
@@ -732,11 +951,13 @@ def _write_session_index(updates=None, *, session_dir: Path | None = None, sessi
                 # Never (re-)index a tracked Resume publication that has not
                 # committed an explicit verified marker, or any denied sid.
                 updated_map = {s.session_id: s.compact() for s in updates
-                               if session_publication_admissible(s)}
+                               if session_publication_admissible(
+                                   s, denied_resume_ids=denied_resume_ids)}
 
             existing = [
                 e for e in existing
                 if (e.get('session_id') in in_memory_ids or e.get('session_id') in on_disk_ids)
+                and not _denied_ids_contains(denied_resume_ids, e.get('session_id'))
             ]
 
             existing_ids = {e.get('session_id') for e in existing}
@@ -1795,7 +2016,18 @@ class Session:
                 f"session {self.session_id!r} is being resumed in WebUI; "
                 f"refusing a concurrent save"
             )
+        # A2 commit fence: a tracked Resume sidecar's canonical persistence is
+        # revalidated against the revocation generation while the per-id fence
+        # is held, so a quarantine that landed after this object's admission
+        # can never be outlived by a reader-triggered save. Ordinary sessions
+        # take neither the fence lock nor the tombstone stat, so the #765
+        # lock-free concurrent-save contract is untouched.
+        _resume_fence_lock = None
         try:
+            if canonical and is_tracked_resume_identity(self):
+                _resume_fence_lock = _resume_sid_lock(self.session_id)
+                _resume_fence_lock.acquire()
+                assert_resume_publication_writable(self)
             return self._write_sidecar_unlocked(
                 touch_updated_at=touch_updated_at,
                 skip_index=skip_index,
@@ -1803,6 +2035,8 @@ class Session:
                 _publish_side_effects=_publish_side_effects,
             )
         finally:
+            if _resume_fence_lock is not None:
+                _resume_fence_lock.release()
             if canonical:
                 end_session_save(self.session_id)
 
@@ -5336,7 +5570,18 @@ def _resolve_session_once(
         # wins even when a delayed reader loaded the object during the
         # publication window, or when a failed quarantine left the canonical
         # on disk. Evict so a later read cannot resurrect it from the LRU.
-        if not session_publication_admissible(cached):
+        # A2: for a tracked Resume identity the authorization is revalidated
+        # against the revocation generation in the same critical section that
+        # would insert into the cache, so a reader preempted between the
+        # admissibility check and the cache write can no longer repopulate it
+        # after a quarantine. Ordinary sessions keep the cheap predicate.
+        if is_tracked_resume_identity(cached):
+            _authorized = admit_session(
+                sid, cached, cache_on_miss=False, promote_cache=promote_cache,
+            )
+        else:
+            _authorized = session_publication_admissible(cached)
+        if not _authorized:
             with LOCK:
                 if SESSIONS.get(sid) is cached:
                     SESSIONS.pop(sid, None)
@@ -5345,7 +5590,10 @@ def _resolve_session_once(
     if metadata_only:
         s = Session.load_metadata_only(sid)
         if s:
-            if not session_publication_admissible(s):
+            if is_tracked_resume_identity(s):
+                if not admit_session(sid, s, cache_on_miss=False, promote_cache=promote_cache):
+                    raise KeyError(sid)
+            elif not session_publication_admissible(s):
                 raise KeyError(sid)
             return s
     else:
@@ -5353,14 +5601,18 @@ def _resolve_session_once(
             raise _FullSessionResolveRequired
         s = Session.load(sid)
     if s:
-        if not session_publication_admissible(s):
-            raise KeyError(sid)
-        if cache_on_miss:
-            with LOCK:
-                SESSIONS[sid] = s
-                if promote_cache:
-                    SESSIONS.move_to_end(sid)
-                _evict_sessions_over_cap()  # #4765: safe LRU eviction (never active/unsaved)
+        if is_tracked_resume_identity(s):
+            if not admit_session(sid, s, cache_on_miss=cache_on_miss, promote_cache=promote_cache):
+                raise KeyError(sid)
+        else:
+            if not session_publication_admissible(s):
+                raise KeyError(sid)
+            if cache_on_miss:
+                with LOCK:
+                    SESSIONS[sid] = s
+                    if promote_cache:
+                        SESSIONS.move_to_end(sid)
+                    _evict_sessions_over_cap()  # #4765: safe LRU eviction (never active/unsaved)
         if not metadata_only:
             try:
                 synced_from_state = _sync_sidecar_from_state_db_if_newer(s)
@@ -6855,7 +7107,7 @@ def all_sessions(
                 raise ValueError("empty session index while session files exist")
             index = [
                 s for s in index
-                if str(s.get('session_id') or '') not in denied_resume_ids
+                if not _denied_ids_contains(denied_resume_ids, s.get('session_id'))
                 and (
                     str(s.get('session_id') or '') in in_memory_ids
                     or (
@@ -6895,7 +7147,8 @@ def all_sessions(
             index_map = {s['session_id']: s for s in index}
             with LOCK:
                 for s in SESSIONS.values():
-                    if s.session_id in denied_resume_ids or not session_publication_admissible(s):
+                    if _denied_ids_contains(denied_resume_ids, s.session_id) or not session_publication_admissible(
+                        s, denied_resume_ids=denied_resume_ids):
                         continue
                     index_map[s.session_id] = s.compact(
                         include_runtime=True,
@@ -6908,7 +7161,7 @@ def all_sessions(
                 missing_persisted_ids = sorted(
                     str(sid) for sid in persisted_ids
                     if sid and str(sid) not in indexed_ids
-                    and str(sid) not in denied_resume_ids
+                    and not _denied_ids_contains(denied_resume_ids, sid)
                 )
             # #4985: the tombstone is intentionally NOT a blind-drop filter
             # on missing_persisted_ids. A tombstoned sid whose sidecar is
@@ -6925,13 +7178,14 @@ def all_sessions(
             if missing_persisted_ids:
                 _diag_stage(diag, "all_sessions.recover_missing_index_sidecars")
                 for sid in missing_persisted_ids:
-                    if sid in denied_resume_ids:
+                    if _denied_ids_contains(denied_resume_ids, sid):
                         continue
                     try:
                         sidecar = Session.load_metadata_only(sid)
                     except Exception:
                         sidecar = None
-                    if not sidecar or not session_publication_admissible(sidecar):
+                    if not sidecar or not session_publication_admissible(
+                        sidecar, denied_resume_ids=denied_resume_ids):
                         continue
                     index_map[sidecar.session_id] = sidecar.compact(
                         include_runtime=True,

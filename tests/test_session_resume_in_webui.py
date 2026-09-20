@@ -1675,9 +1675,18 @@ def test_parked_first_publication_fails_competing_resume_closed(resume_env, monk
         models.get_session(sid)
 
 
-def test_index_error_after_verified_commit_keeps_the_verified_publication(resume_env, monkeypatch):
+def test_source_change_during_index_write_after_verified_commit_is_safe_degradation(resume_env, monkeypatch):
     """F1 (probe ``index-error-source-change``): the post-publish source re-read
-    still runs; an index failure after the source moved must not return success."""
+    runs BEFORE the index write, so a source that moves in the index window is
+    already covered by the verified commit. This schedule injects NO index
+    exception (the real index writer runs and succeeds) — the name says exactly
+    what it proves: a post-verification source change observed during the index
+    write degrades safely to the committed verified artifact.
+
+    The real index-exception schedules live in
+    ``test_real_index_exception_after_verified_commit_keeps_verified_publication``
+    and ``test_marker_loss_during_index_failure_is_not_adopted``.
+    """
     env = resume_env
     sid = "index-error-source-change"
     db = _alpha_db(env)
@@ -1801,9 +1810,18 @@ def test_unreadable_canonical_with_publish_error_is_quarantined(resume_env, monk
     assert list((env["sessions_dir"] / ".resume-quarantine").glob(f"{sid}*.json"))
 
 
-def test_delayed_cache_fill_cannot_resurrect_a_quarantined_publication(resume_env, monkeypatch):
-    """F3 (probe ``cached``): a reader delayed across the publication window
-    must not restore a writable object/index entry after quarantine."""
+def test_provisional_read_during_first_publication_is_rejected(resume_env, monkeypatch):
+    """F3 (probe ``cached``): a reader that looks at the canonical while the
+    first publication is still PROVISIONAL is refused, and cannot restore a
+    writable object or index entry after the eventual quarantine.
+
+    The reader here is synchronous: it runs inside the publish wrapper, i.e. at
+    the exact instant the provisional canonical is live, and it gets no
+    writable object. (The delayed/barrier schedules that exercise a reader
+    parked across a quarantine are
+    ``test_reader_parked_after_affirmative_check_cannot_admit_after_rejection``
+    and ``test_post_rejection_save_cannot_recreate_a_quarantined_canonical``.)
+    """
     env = resume_env
     sid = "cached"
     _make_state_db(_alpha_db(env), sid=sid, messages=3)
@@ -1893,3 +1911,479 @@ def test_ordinary_save_concurrency_is_not_serialized(resume_env, monkeypatch):
     assert sorted(done) == ["concurrent-0", "concurrent-1"], done
     for sid in done:
         assert (env["sessions_dir"] / f"{sid}.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# A1-A4 (Astra 4f0ad5d8): adversarial regressions
+#
+# A1  recovery of the CURRENT attempt's publication must require an explicit
+#     ``resume_publication_state == 'verified'`` marker; a missing, empty,
+#     unknown or provisional marker is never proof.
+# A2  admission/cache insertion and denial/eviction are atomic, and a tracked
+#     Resume sidecar is revalidated at persistence, so a reader parked after an
+#     affirmative admissibility check (or one holding an already-admitted
+#     object) can neither cache nor save a revoked publication.
+# A3  denial wins for marker-absent legacy Resume sidecars in direct lookup,
+#     the cache, the fallback scan, the full index rebuild and incremental
+#     index updates.
+# A4  real index-exception and after-affirmative-check barriers, including a
+#     real post-rejection save attempt.
+# ---------------------------------------------------------------------------
+
+
+def _isolate_resume_index(monkeypatch, models, env) -> Path:
+    """Point the sidebar index at the test session dir for this test only."""
+    index = env["sessions_dir"] / "_index.json"
+    index.write_text("[]", encoding="utf-8")
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", index)
+    return index
+
+
+def _make_tracked_resume_sidecar(env, sid, *, marker, messages=3, profile="alpha"):
+    """Write a Resume sidecar directly, with an explicit publication marker.
+
+    ``marker=None`` downgrades it to a pre-fix *legacy* Resume sidecar: it keeps
+    every ownership field but carries no publication marker at all.
+    """
+    models = env["models"]
+    session = models.Session(
+        session_id=sid,
+        profile=profile,
+        messages=[{"role": "user", "content": f"m{i}"} for i in range(messages)],
+        read_only=False,
+    )
+    session.resume_source_profile = profile
+    session.resume_source_state_db = str(_alpha_db(env))
+    session.resume_lineage_root_id = sid
+    session.resume_lineage_tip_id = sid
+    if marker is not None:
+        session.resume_publication_state = marker
+    session.save()
+    return session, env["sessions_dir"] / f"{sid}.json"
+
+
+def _strip_marker_from_disk(sidecar: Path) -> None:
+    """Remove the publication marker from a canonical without re-saving it."""
+    data = json.loads(sidecar.read_text(encoding="utf-8"))
+    data.pop("resume_publication_state", None)
+    sidecar.write_text(json.dumps(data), encoding="utf-8")
+
+
+# ------------------------------- A1 ----------------------------------------
+
+
+@pytest.mark.parametrize("marker", [None, "", "provisional", "unexpected"])
+def test_post_link_recovery_requires_an_explicit_verified_marker(
+    resume_env, monkeypatch, marker
+):
+    """A1: recovery over a post-link error never adopts an unverified marker.
+
+    The publication attempt owns the canonical (it linked it itself), so the
+    recovery path must demand ``resume_publication_state == 'verified'``. A
+    missing, empty, provisional or unknown marker is rejected and the artifact
+    is made inaccessible - the legacy marker-absent migration policy lives on a
+    different, existing-sidecar-only path and must not leak in here.
+    """
+    env = resume_env
+    models = env["models"]
+    routes = env["routes"]
+    tag = marker if marker else "absent"
+    sid = f"a1-recovery-{tag}"
+    _make_state_db(_alpha_db(env), sid=sid, messages=3)
+    sidecar = env["sessions_dir"] / f"{sid}.json"
+    _isolate_resume_index(monkeypatch, models, env)
+
+    real_publish = routes.publish_staged_session_sidecar
+
+    def publish_then_break(session, staging_path):
+        real_publish(session, staging_path)
+        # The canonical is now linked and owned by THIS attempt. Simulate the
+        # marker never reaching disk (or reaching it incorrectly) and a
+        # post-link persistence error inside the same publication window.
+        data = json.loads(sidecar.read_text(encoding="utf-8"))
+        if marker is None:
+            data.pop("resume_publication_state", None)
+        else:
+            data["resume_publication_state"] = marker
+        sidecar.write_text(json.dumps(data), encoding="utf-8")
+        raise OSError("post-link persist failure")
+
+    monkeypatch.setattr(routes, "publish_staged_session_sidecar", publish_then_break)
+
+    routes._handle_session_resume_in_webui(env["rec"], _body(sid=sid))
+
+    assert env["rec"].status == 500, (tag, env["rec"].error())
+    assert models.is_resume_publication_denied(sid)
+    assert not sidecar.exists(), f"{tag}: rejected publication stayed live"
+    with pytest.raises(KeyError):
+        models.get_session(sid)
+    assert sid not in models.SESSIONS
+
+
+def test_marker_loss_during_index_failure_is_not_adopted(resume_env, monkeypatch):
+    """A1: a verified marker lost during the index window is not proof.
+
+    The verified commit succeeded, then the index write failed AND the on-disk
+    marker was gone by the time the post-index integrity re-read ran. The
+    attempt must not fall back to the legacy "no marker means committed"
+    compatibility rule for a publication it owns: it fails closed, denies the
+    id, and quarantines the artifact out of the live namespace.
+    """
+    env = resume_env
+    models = env["models"]
+    routes = env["routes"]
+    sid = "a1b-marker-loss"
+    _make_state_db(_alpha_db(env), sid=sid, messages=3)
+    sidecar = env["sessions_dir"] / f"{sid}.json"
+    _isolate_resume_index(monkeypatch, models, env)
+
+    real_index = models._write_session_index
+
+    def index_strip_marker_and_raise(updates=None, **kwargs):
+        if updates:
+            _strip_marker_from_disk(sidecar)
+            raise OSError("index write failed after verified commit")
+        return real_index(updates=updates, **kwargs)
+
+    monkeypatch.setattr(models, "_write_session_index", index_strip_marker_and_raise)
+
+    routes._handle_session_resume_in_webui(env["rec"], _body(sid=sid))
+
+    assert env["rec"].status == 500, env["rec"].error()
+    assert models.is_resume_publication_denied(sid)
+    assert not sidecar.exists(), "the marker-lost artifact stayed in the live namespace"
+    with pytest.raises(KeyError):
+        models.get_session(sid)
+    assert models.Session.load(sid) is None
+    assert sid not in models.SESSIONS
+
+
+def test_real_index_exception_after_verified_commit_keeps_verified_publication(
+    resume_env, monkeypatch
+):
+    """A4/A1 positive control: a REAL index exception over an intact verified
+    artifact is the F1 safe-degradation path, and it still succeeds.
+
+    This is the schedule the misleadingly-named older test claimed to cover but
+    did not (it injected no index exception at all).
+    """
+    env = resume_env
+    models = env["models"]
+    routes = env["routes"]
+    sid = "a4-real-index-exception"
+    _make_state_db(_alpha_db(env), sid=sid, messages=3)
+    sidecar = env["sessions_dir"] / f"{sid}.json"
+    _isolate_resume_index(monkeypatch, models, env)
+
+    real_index = models._write_session_index
+    raised = {"n": 0}
+
+    def index_raise_once(updates=None, **kwargs):
+        if updates:
+            raised["n"] += 1
+            raise OSError("index write failed after verified commit")
+        return real_index(updates=updates, **kwargs)
+
+    monkeypatch.setattr(models, "_write_session_index", index_raise_once)
+
+    routes._handle_session_resume_in_webui(env["rec"], _body(sid=sid))
+
+    assert raised["n"] == 1, "the real index exception was never injected"
+    assert env["rec"].status == 200, env["rec"].error()
+    assert not models.is_resume_publication_denied(sid)
+    data = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert data["resume_publication_state"] == "verified"
+    models.SESSIONS.clear()
+    assert models.get_session(sid) is not None
+
+
+# ------------------------------- A2 ----------------------------------------
+
+
+def test_reader_parked_after_affirmative_check_cannot_admit_after_rejection(
+    resume_env, monkeypatch
+):
+    """A2/A4: the after-affirmative-check barrier.
+
+    A reader is parked INSIDE the admissibility predicate, immediately after it
+    has returned True for the live canonical. The attempt is then rejected and
+    quarantined. When the reader resumes, the revocation generation recheck must
+    refuse admission: no writable object is returned and the cache is not
+    repopulated. (Before the fix the predicate ran outside the cache-insertion
+    critical section, so the parked reader rewrote ``SESSIONS`` after the
+    quarantine.)
+    """
+    env = resume_env
+    models = env["models"]
+    routes = env["routes"]
+    sid = "a2-affirmative-barrier"
+    _make_state_db(_alpha_db(env), sid=sid, messages=3)
+    sidecar = env["sessions_dir"] / f"{sid}.json"
+    _isolate_resume_index(monkeypatch, models, env)
+
+    entered = threading.Event()
+    release = threading.Event()
+    reader = {}
+    real_admissible = models.session_publication_admissible
+
+    def parking_admissible(session, **kwargs):
+        result = real_admissible(session, **kwargs)
+        if (
+            result
+            and str(getattr(session, "session_id", "") or "") == sid
+            and not entered.is_set()
+        ):
+            entered.set()
+            release.wait(10.0)  # park AFTER the affirmative check
+        return result
+
+    monkeypatch.setattr(models, "session_publication_admissible", parking_admissible)
+
+    def reader_body():
+        try:
+            obj = models.get_session(sid)
+            reader["object"] = obj
+            reader["writable"] = not bool(getattr(obj, "read_only", False))
+        except KeyError:
+            reader["refused"] = True
+        except Exception as exc:  # pragma: no cover - diagnostic
+            reader["error"] = repr(exc)
+
+    real_index = models._write_session_index
+
+    def index_start_reader_strip_and_raise(updates=None, **kwargs):
+        if updates:
+            thread = threading.Thread(target=reader_body, daemon=True)
+            thread.start()
+            assert entered.wait(10.0), "reader never reached the affirmative check"
+            reader["thread"] = thread
+            _strip_marker_from_disk(sidecar)
+            raise OSError("index write failed after verified commit")
+        return real_index(updates=updates, **kwargs)
+
+    monkeypatch.setattr(models, "_write_session_index", index_start_reader_strip_and_raise)
+
+    routes._handle_session_resume_in_webui(env["rec"], _body(sid=sid))
+
+    assert env["rec"].status == 500, env["rec"].error()
+    assert models.is_resume_publication_denied(sid)
+
+    release.set()
+    reader["thread"].join(10.0)
+    assert not reader["thread"].is_alive()
+    assert "error" not in reader, reader.get("error")
+    assert reader.get("refused") is True, reader
+    assert "object" not in reader, "a revoked publication was served writable"
+    assert sid not in models.SESSIONS, "a revoked publication was re-cached"
+
+
+def test_post_rejection_save_cannot_recreate_a_quarantined_canonical(
+    resume_env, monkeypatch
+):
+    """A2/A4: a real post-rejection save attempt on an already-admitted object.
+
+    The reader legitimately admitted and cached the verified publication BEFORE
+    the rejection. After the denial and quarantine the canonical is gone, but
+    the caller still holds the writable object. Its real ``save()`` must be
+    refused, and the canonical must NOT reappear. (Before the fix the save
+    recreated it: quarantine only evicted the cache and wrote a tombstone, and
+    the save path never consulted either.)
+    """
+    env = resume_env
+    models = env["models"]
+    sid = "a2-post-rejection-save"
+    sidecar = env["sessions_dir"] / f"{sid}.json"
+    _isolate_resume_index(monkeypatch, models, env)
+
+    _make_tracked_resume_sidecar(env, sid, marker=models.RESUME_PUBLICATION_VERIFIED)
+    assert sidecar.exists()
+
+    models.SESSIONS.clear()
+    admitted = models.get_session(sid)
+    assert admitted is not None and not bool(getattr(admitted, "read_only", False))
+    assert sid in models.SESSIONS
+
+    # Deny + evict (atomic in the fixed implementation), then simulate the
+    # best-effort move out of the live namespace succeeding.
+    models.mark_resume_publication_denied(sid, reason="post-rejection save probe")
+    models.evict_session_from_cache(sid)
+    assert models.is_resume_publication_denied(sid)
+    sidecar.unlink()
+    assert not sidecar.exists()
+
+    with pytest.raises(PermissionError):
+        admitted.save(skip_index=True)
+
+    assert not sidecar.exists(), "a post-rejection save recreated the canonical"
+    assert sid not in models.SESSIONS
+    with pytest.raises(KeyError):
+        models.get_session(sid)
+
+
+# ------------------------------- A3 ----------------------------------------
+
+
+def test_denied_legacy_resume_sidecar_fails_closed_in_lookup_cache_and_scan(
+    resume_env, monkeypatch
+):
+    """A3: denial wins for a marker-absent legacy Resume sidecar.
+
+    The sidecar keeps every resume ownership field but no publication marker
+    (a pre-fix artifact), its canonical stays on disk (the quarantine move
+    failed), and it IS denied. Direct lookup, the cache and the fallback scan
+    must all refuse it.
+    """
+    env = resume_env
+    models = env["models"]
+    sid = "a3-legacy-denied"
+    _isolate_resume_index(monkeypatch, models, env)
+    _, sidecar = _make_tracked_resume_sidecar(env, sid, marker=None)
+
+    legacy = models.Session.load(sid)
+    assert legacy is not None
+    # It really is a pre-fix legacy Resume sidecar: ownership fields present,
+    # publication marker absent.
+    assert models.resume_publication_state(legacy) is None
+    assert getattr(legacy, "resume_source_state_db", None)
+    assert getattr(legacy, "resume_lineage_root_id", None) == sid
+    # Control: a legacy sidecar with no denial is still admissible (the
+    # supported pre-fix migration policy must not regress).
+    assert models.session_publication_admissible(legacy)
+
+    models.mark_resume_publication_denied(sid, reason="legacy denial probe")
+    assert models.is_resume_publication_denied(sid)
+    assert sidecar.exists(), "the move was supposed to fail; the file stays"
+
+    models.SESSIONS.clear()
+    with pytest.raises(KeyError):
+        models.get_session(sid)
+    assert sid not in models.SESSIONS
+
+    loaded = models.Session.load(sid)
+    assert loaded is not None and not models.session_publication_admissible(loaded)
+
+    models.SESSIONS.clear()
+    rows = models.all_sessions()
+    assert sid not in [row.get("session_id") for row in rows]
+    assert not models.SESSIONS
+
+
+def test_denied_legacy_resume_sidecar_is_dropped_by_full_index_rebuild(
+    resume_env, monkeypatch
+):
+    """A3: a full ``_write_session_index()`` rebuild drops the denied legacy row
+    while keeping an un-denied legacy sibling (so the fix is not a blanket
+    "hide every Resume sidecar")."""
+    env = resume_env
+    models = env["models"]
+    denied_sid = "a3-rebuild-denied"
+    control_sid = "a3-rebuild-control"
+    index = _isolate_resume_index(monkeypatch, models, env)
+    _make_tracked_resume_sidecar(env, denied_sid, marker=None)
+    _make_tracked_resume_sidecar(env, control_sid, marker=None)
+
+    models.mark_resume_publication_denied(denied_sid, reason="rebuild probe")
+    models.SESSIONS.clear()
+
+    models._write_session_index()
+
+    rows = json.loads(index.read_text(encoding="utf-8"))
+    ids = [row.get("session_id") for row in rows]
+    assert denied_sid not in ids, "the full rebuild re-indexed a denied legacy row"
+    assert control_sid in ids, "an un-denied legacy sidecar was wrongly dropped"
+
+
+def test_denied_legacy_resume_sidecar_is_dropped_by_incremental_index_update(
+    resume_env, monkeypatch
+):
+    """A3: an incremental ``_write_session_index(updates=...)`` drops a denied
+    legacy row that is already in the index."""
+    env = resume_env
+    models = env["models"]
+    denied_sid = "a3-incremental-denied"
+    index = _isolate_resume_index(monkeypatch, models, env)
+    _, sidecar = _make_tracked_resume_sidecar(env, denied_sid, marker=None)
+    models.mark_resume_publication_denied(denied_sid, reason="incremental probe")
+
+    # Seed the index exactly as a pre-fix deployment would have left it.
+    stale_row = models.Session.load(denied_sid).compact()
+    index.write_text(json.dumps([stale_row]), encoding="utf-8")
+
+    control = models.Session(
+        session_id="a3-incremental-control",
+        profile="alpha",
+        messages=[{"role": "user", "content": "control"}],
+    )
+    models._write_session_index(updates=[control])
+
+    rows = json.loads(index.read_text(encoding="utf-8"))
+    ids = [row.get("session_id") for row in rows]
+    assert denied_sid not in ids, "the incremental update kept a denied legacy row"
+    assert "a3-incremental-control" in ids
+    assert sidecar.exists()
+
+
+def test_all_sessions_index_path_drops_a_denied_legacy_resume_sidecar(
+    resume_env, monkeypatch
+):
+    """A3: the sidebar index fast path must deny the legacy sid, not just a
+    marked one, when its canonical is still on disk."""
+    env = resume_env
+    models = env["models"]
+    denied_sid = "a3-indexpath-denied"
+    control_sid = "a3-indexpath-control"
+    index = _isolate_resume_index(monkeypatch, models, env)
+    _make_tracked_resume_sidecar(env, denied_sid, marker=None)
+    _make_tracked_resume_sidecar(env, control_sid, marker=None)
+    models.mark_resume_publication_denied(denied_sid, reason="index-path probe")
+
+    # A valid index (both rows present) so all_sessions() takes the fast path.
+    rows = [
+        models.Session.load(denied_sid).compact(),
+        models.Session.load(control_sid).compact(),
+    ]
+    index.write_text(json.dumps(rows), encoding="utf-8")
+
+    models.SESSIONS.clear()
+    listed = [row.get("session_id") for row in models.all_sessions()]
+    assert denied_sid not in listed
+    assert control_sid in listed
+
+
+def test_denial_snapshot_failure_fails_closed_for_tracked_resume_identity(
+    resume_env, monkeypatch
+):
+    """A3: an unavailable denial *snapshot* is "unknown", never "no denials".
+
+    ``_denied_resume_publication_ids`` returns None when the denial directory
+    cannot be listed. The per-id tombstone check must then be used instead of
+    affirmative absence, for a marker-absent legacy Resume identity as much as
+    for a marked one - direct lookup, enumeration and the index rebuild.
+    """
+    env = resume_env
+    models = env["models"]
+    denied_sid = "a3-snapshot-denied"
+    control_sid = "a3-snapshot-control"
+    index = _isolate_resume_index(monkeypatch, models, env)
+    _make_tracked_resume_sidecar(env, denied_sid, marker=None)
+    _make_tracked_resume_sidecar(env, control_sid, marker=None)
+    models.mark_resume_publication_denied(denied_sid, reason="snapshot probe")
+
+    monkeypatch.setattr(models, "_denied_resume_publication_ids", lambda *a, **k: None)
+
+    models.SESSIONS.clear()
+    with pytest.raises(KeyError):
+        models.get_session(denied_sid)
+    assert not models.session_publication_admissible(models.Session.load(denied_sid))
+
+    listed = [row.get("session_id") for row in models.all_sessions()]
+    assert denied_sid not in listed
+    assert control_sid in listed, "an un-denied legacy sidecar was wrongly dropped"
+
+    models._write_session_index()
+    ids = [row.get("session_id") for row in json.loads(index.read_text(encoding="utf-8"))]
+    assert denied_sid not in ids
+
+    # Ordinary (non-Resume) sessions are unaffected by an unavailable snapshot.
+    plain = models.Session(session_id="a3-plain", profile="alpha")
+    assert models.session_publication_admissible(plain)

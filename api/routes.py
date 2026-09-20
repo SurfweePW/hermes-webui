@@ -29444,10 +29444,14 @@ def _quarantine_resume_sidecar(sidecar_path: Path, sid: str) -> Path | None:
     """
     sidecar_path = Path(sidecar_path)
     # 1) Denial first — this fences in-flight Session.load/cache publication.
+    # A2: `revoke_resume_publication` records the tombstone AND evicts any cached
+    # writable object in ONE critical section that also bumps the revocation
+    # generation, so a reader parked between its admissibility check and its
+    # cache insertion is refused rather than repopulating the cache.
     try:
-        from api.models import mark_resume_publication_denied
+        from api.models import revoke_resume_publication
 
-        mark_resume_publication_denied(
+        revoke_resume_publication(
             sid, reason="resume publication failed post-publish verification"
         )
     except Exception:
@@ -29559,12 +29563,17 @@ class _ResumePublicationRejected(RuntimeError):
     """
 
 
-def _resume_publication_committed(session) -> bool:
-    """True when *session* is an owned, committed resume sidecar.
+def _existing_sidecar_legacy_committed(session) -> bool:
+    """Legacy existing-sidecar idempotency/migration policy (A1-distinct path).
 
-    A tracked publication (explicit ``resume_publication_state``) is committed
-    only when verified and not denied. An ordinary or pre-fix legacy resume
-    sidecar carries no marker and is treated as committed for compatibility.
+    ONLY for a sidecar that a *previous* attempt (or a pre-fix deployment)
+    already owns: a marked publication is committed only when verified and not
+    denied, while an unprefixed legacy resume sidecar with no marker is treated
+    as committed for migration compatibility.
+
+    This predicate must NEVER be used to accept a publication owned by the
+    CURRENT Resume attempt: use ``_resume_attempt_publication_verified`` there,
+    which requires the explicit verified marker (A1).
     """
     if session is None:
         return False
@@ -29579,6 +29588,19 @@ def _resume_publication_committed(session) -> bool:
     return state == "verified"
 
 
+def _resume_attempt_publication_verified(session) -> bool:
+    """Strict proof that the CURRENT attempt's publication is committed (A1).
+
+    Requires the explicit ``resume_publication_state == 'verified'`` marker and
+    the absence of a denial. A missing, empty, unknown or provisional marker is
+    never accepted, so a marker lost (or never written) during a post-index or
+    post-link failure can no longer be adopted as a committed publication.
+    """
+    from api.models import resume_publication_strictly_verified
+
+    return resume_publication_strictly_verified(session)
+
+
 def _await_resume_publication_commit(existing, sidecar_path: Path, sid: str, *, timeout: float = 1.5):
     """Bounded, fail-closed wait for a competing first publication to commit.
 
@@ -29591,7 +29613,7 @@ def _await_resume_publication_commit(existing, sidecar_path: Path, sid: str, *, 
     deadline = time.monotonic() + max(0.0, float(timeout))
     current = existing
     while True:
-        if _resume_publication_committed(current):
+        if _existing_sidecar_legacy_committed(current):
             return current
         if time.monotonic() >= deadline:
             return None
@@ -29698,7 +29720,7 @@ def _handle_session_resume_in_webui(handler, body):
     # not yet committed is PROVISIONAL. Never treat it as an owned writable
     # sidecar (idempotent success) — wait briefly for the first publisher to
     # commit the explicit verified marker, then fail closed.
-    if existing is not None and not _resume_publication_committed(existing):
+    if existing is not None and not _existing_sidecar_legacy_committed(existing):
         existing = _await_resume_publication_commit(existing, sidecar_path, sid)
         if existing is None:
             return bad(
@@ -29716,7 +29738,7 @@ def _handle_session_resume_in_webui(handler, body):
     if not ended_at and not end_reason:
         already_owned = (
             existing is not None
-            and _resume_publication_committed(existing)
+            and _existing_sidecar_legacy_committed(existing)
             and _profiles_match(getattr(existing, "profile", None), profile)
             and not bool(getattr(existing, "read_only", False))
         )
@@ -29902,7 +29924,7 @@ def _handle_session_resume_in_webui(handler, body):
                             "an unreadable WebUI sidecar already owns this session id",
                             409,
                         )
-                    if not _resume_publication_committed(published):
+                    if not _existing_sidecar_legacy_committed(published):
                         published = _await_resume_publication_commit(published, sidecar_path, sid)
                         if published is None:
                             return bad(
@@ -30016,7 +30038,7 @@ def _handle_session_resume_in_webui(handler, body):
                             still = None
                         if not (
                             still is not None
-                            and _resume_publication_committed(still)
+                            and _resume_attempt_publication_verified(still)
                             and _same_resume_identity(
                                 still,
                                 sid=sid,
@@ -30057,7 +30079,7 @@ def _handle_session_resume_in_webui(handler, body):
                     recovered = None
                 if (
                     recovered is not None
-                    and _resume_publication_committed(recovered)
+                    and _resume_attempt_publication_verified(recovered)
                     and _same_resume_identity(
                         recovered,
                         sid=sid,
