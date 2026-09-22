@@ -2490,6 +2490,15 @@ def _build_session_list_cache_payload(
             show_kanban_sessions=show_kanban_sessions,
             source_filter=source_filter,
         )
+        # Keep the list payload consistent with the detail payload.  In
+        # operator projection mode every row here is a foreign state.db row;
+        # copy before stamping so the cached source rows remain untouched.
+        # The frontend requires read_only=true before it will expose the
+        # explicit Resume in WebUI action for an eligible CLI/TUI/Desktop row.
+        if str(os.getenv("HERMES_WEBUI_EXTERNAL_STATE_READ_ONLY", "")).strip().lower() in {
+            "1", "true", "yes", "on",
+        }:
+            deduped_cli = [dict(s, read_only=True) for s in deduped_cli]
     else:
         diag_stage("filter_webui_sessions")
         webui_sessions = [s for s in webui_sessions if not _is_cli_session_for_settings(s)]
