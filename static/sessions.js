@@ -7475,8 +7475,12 @@ function _attachChildSessionsToSidebarRows(collapsedRows, rawSessions, rawRefere
       // (hasHiddenArchivedAncestor / #4293), generalizing the "parent hidden"
       // trigger from archived to filtered-out. A cross-surface WebUI child of a
       // genuinely external (messaging/CLI) parent is handled by the parentIsExternal
-      // branch above and still orphans as before.
-      if(child&&child._cross_surface_child_session&&_isChildSession(child)) continue;
+      // branch above and still orphans as before. A resumable read-only external
+      // child is the narrow exception: its sidebar action menu is the only UI path
+      // to POST /api/session/resume_in_webui, so suppressing it makes takeover
+      // impossible when the parent belongs to another source bucket.
+      const resumableExternalChild=typeof _canResumeSessionInWebUi==='function'&&_canResumeSessionInWebUi(child);
+      if(child&&child._cross_surface_child_session&&_isChildSession(child)&&!resumableExternalChild) continue;
       orphans.push({...child,_orphan_child_session:true});
     }
   }
