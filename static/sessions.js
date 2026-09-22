@@ -2612,7 +2612,7 @@ async function _openSidebarSession(session, loadOpts={}){
   }
   // #5409: close mobile sidebar AFTER veto guard passes — only close if open proceeds.
   if(typeof closeMobileSidebar==='function')closeMobileSidebar();
-  if(_isExternalSession(session)){
+  if(_isExternalSession(session)&&!_isReadOnlySession(session)){
     try{await api('/api/session/import_cli',{method:'POST',body:JSON.stringify(_externalImportPayload(session))});}
     catch(_e){ /* import failed -- fall through to read-only view */ }
   }
@@ -8871,7 +8871,8 @@ function renderSessionListFromCache(){
           row.appendChild(state);
           const readOnlyChild=_isReadOnlySession(child);
           let actions=null;
-          if(!readOnlyChild){
+          const canOpenChildActions=!readOnlyChild||_canResumeSessionInWebUi(child);
+          if(canOpenChildActions){
             actions=document.createElement('div');
             actions.className='session-actions';
             const menuBtn=document.createElement('button');
@@ -8892,11 +8893,13 @@ function renderSessionListFromCache(){
             };
             actions.appendChild(menuBtn);
             row.appendChild(actions);
-            row.append(
-              _makeSessionSwipeAffordance('right',child.archived?'undo':'archive',child.archived?'Restore':t('session_batch_archive')),
-              _makeSessionSwipeAffordance('left','trash-2',t('session_batch_delete')),
-            );
-            installForkChildSwipe(row, child, actions);
+            if(!readOnlyChild){
+              row.append(
+                _makeSessionSwipeAffordance('right',child.archived?'undo':'archive',child.archived?'Restore':t('session_batch_archive')),
+                _makeSessionSwipeAffordance('left','trash-2',t('session_batch_delete')),
+              );
+              installForkChildSwipe(row, child, actions);
+            }
           }
           row.oncontextmenu=(e)=>{
             if(readOnlyChild) return;
@@ -8970,7 +8973,8 @@ function renderSessionListFromCache(){
     el.appendChild(state);
     // Single trigger button that opens a shared dropdown menu
     let actions=null;
-    if(!readOnly){
+    const canOpenActions=!readOnly||_canResumeSessionInWebUi(s);
+    if(canOpenActions){
       actions=document.createElement('div');
       actions.className='session-actions';
       const menuBtn=document.createElement('button');

@@ -212,7 +212,7 @@ def test_readonly_menu_offers_resume_action_behind_source_gate():
 
 
 def test_readonly_menu_branch_and_row_open_path_unchanged():
-    """Copy link / Export as HTML still own the read-only early return."""
+    """Read-only rows remain non-mutating until the explicit resume action."""
     menu = _open_session_action_menu(SESSIONS_JS)
     assert (
         "if(isReadOnly){\n"
@@ -221,8 +221,8 @@ def test_readonly_menu_branch_and_row_open_path_unchanged():
         "    return;\n"
         "  }"
     ) in menu
-    # Normal row click keeps its existing import/profile/load path.
     open_row = _function_body(SESSIONS_JS, "_openSidebarSession")
+    assert "if(_isExternalSession(session)&&!_isReadOnlySession(session)){" in open_row
     assert "/api/session/import_cli" in open_row
     assert "await _ensureSidebarSessionProfile(session);" in open_row
     assert "await loadSession(session.session_id," in open_row
@@ -231,6 +231,13 @@ def test_readonly_menu_branch_and_row_open_path_unchanged():
     body = _function_body(SESSIONS_JS, "resumeSessionInWebUi")
     assert "session.read_only" not in body
     assert "read_only = false" not in body
+
+
+def test_resumable_readonly_rows_expose_the_action_menu_trigger():
+    assert "const canOpenActions=!readOnly||_canResumeSessionInWebUi(s);" in SESSIONS_JS
+    assert "if(canOpenActions){" in SESSIONS_JS
+    assert "const canOpenChildActions=!readOnlyChild||_canResumeSessionInWebUi(child);" in SESSIONS_JS
+    assert "if(canOpenChildActions){" in SESSIONS_JS
 
 
 # ── 3. Click flow ordering ────────────────────────────────────────────────────
