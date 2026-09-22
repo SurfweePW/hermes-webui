@@ -161,7 +161,7 @@ def _persist_generated_session_title(
         with LOCK:
             SESSIONS[sid] = session
             SESSIONS.move_to_end(sid)
-            _evict_sessions_over_cap()  # #4765: safe LRU eviction (never active/unsaved)
+        _evict_sessions_over_cap()  # #4765: persistence probes stay outside LOCK
     _sync_session_title_to_insights(session)
     _publish_session_list_changed(
         event_reason,
@@ -4187,7 +4187,7 @@ def _ensure_full_session_before_mutation(sid: str, session):
     with LOCK:
         SESSIONS[sid] = full_session
         SESSIONS.move_to_end(sid)
-        _evict_sessions_over_cap()  # #4765: safe LRU eviction (never active/unsaved)
+    _evict_sessions_over_cap()  # #4765: persistence probes stay outside LOCK
     return full_session
 
 
@@ -15914,7 +15914,7 @@ def handle_post(handler, parsed) -> bool:
             with LOCK:
                 SESSIONS[copied_session.session_id] = copied_session
                 SESSIONS.move_to_end(copied_session.session_id)
-                _evict_sessions_over_cap()  # #4765: safe LRU eviction (never active/unsaved)
+            _evict_sessions_over_cap()  # #4765: persistence probes stay outside LOCK
             # Persist immediately. The pre-PR flow (/api/session/new + /api/session/rename)
             # accidentally avoided this because `/api/session/rename` calls `s.save()`.
             # Without this explicit save, the duplicate is in-memory only — if the user
@@ -16760,7 +16760,7 @@ def handle_post(handler, parsed) -> bool:
         with LOCK:
             SESSIONS[branch.session_id] = branch
             SESSIONS.move_to_end(branch.session_id)
-            _evict_sessions_over_cap()  # #4765: safe LRU eviction (never active/unsaved)
+        _evict_sessions_over_cap()  # #4765: persistence probes stay outside LOCK
 
         # Persist only if there are messages (matches new_session pattern)
         if forked_messages:
@@ -24445,7 +24445,7 @@ def _handle_session_compression_recovery_start(handler, body):
             with LOCK:
                 SESSIONS[copied_session.session_id] = copied_session
                 SESSIONS.move_to_end(copied_session.session_id)
-                _evict_sessions_over_cap()
+            _evict_sessions_over_cap()
             created = True
     if created:
         publish_session_list_changed(
@@ -29430,19 +29430,59 @@ def _discard_resume_staging_file(staging_path: Path) -> None:
         )
 
 
-def _quarantine_resume_sidecar(sidecar_path: Path, sid: str) -> Path | None:
+def _resume_canonical_is_committed_publication(sidecar_path: Path) -> bool:
+    """True when the canonical is an explicitly committed, non-denied publication.
+
+    B2: such an artifact was committed by an attempt that finished its own
+    verified commit. A *different*, failing attempt must never revoke it — not
+    by denying the id and not by moving the file out of the live namespace.
+    """
+    from api.models import resume_publication_strictly_verified
+
+    try:
+        current = _load_resume_sidecar_nonmutating(Path(sidecar_path))
+    except Exception:
+        return False
+    if current is None:
+        return False
+    return resume_publication_strictly_verified(current)
+
+
+def _quarantine_resume_sidecar(
+    sidecar_path: Path,
+    sid: str,
+    *,
+    attempt: str | None = None,
+    force: bool = False,
+) -> Path | None:
     """Deny and move an untrusted published resume sidecar out of the live namespace.
 
     F3 (Astra 94bfe8af): quarantine is a durable *denial* first and a
-    best-effort move second. ``mark_resume_publication_denied`` writes a
-    cross-process tombstone BEFORE the canonical is touched, so a delayed
-    reader that already loaded the object during the publication window — and a
-    reader that races a failed move — still fails closed. The move into
-    ``.resume-quarantine`` (never deleted outright) is best effort so an
-    operator can inspect the rejected artifact; when it fails the tombstone
-    still denies the id, so publication stays failed-closed either way.
+    best-effort move second. ``revoke_resume_publication`` records the denial on
+    every durable channel (tombstone AND the publication ledger) BEFORE the
+    canonical is touched, so a delayed reader that already loaded the object
+    during the publication window — and a reader that races a failed move —
+    still fails closed. The move into ``.resume-quarantine`` (never deleted
+    outright) is best effort so an operator can inspect the rejected artifact;
+    when it fails the durable denial still refuses the id, so publication stays
+    failed-closed either way. B1: when BOTH channels fail, the in-flight
+    publication record written before the artifact existed still guards the id,
+    so the fail-closed state does not depend on this process's memory.
+
+    B2: ``force=False`` refuses to revoke an artifact that is already a
+    committed (verified, non-denied) publication — a failed attempt must never
+    revoke another attempt's artifact. Callers that provably own the commit
+    (they just wrote the verified marker for it in this request) pass
+    ``force=True``.
     """
     sidecar_path = Path(sidecar_path)
+    if not force and _resume_canonical_is_committed_publication(sidecar_path):
+        logger.warning(
+            "Refusing to revoke committed Resume publication %s: the canonical "
+            "belongs to an attempt that already finished its verified commit",
+            sid,
+        )
+        return None
     # 1) Denial first — this fences in-flight Session.load/cache publication.
     # A2: `revoke_resume_publication` records the tombstone AND evicts any cached
     # writable object in ONE critical section that also bumps the revocation
@@ -29452,23 +29492,35 @@ def _quarantine_resume_sidecar(sidecar_path: Path, sid: str) -> Path | None:
         from api.models import revoke_resume_publication
 
         revoke_resume_publication(
-            sid, reason="resume publication failed post-publish verification"
+            sid,
+            reason="resume publication failed post-publish verification",
+            attempt=attempt,
         )
     except Exception:
         logger.exception("Failed to record resume quarantine denial for %s", sid)
-    # 2) Best-effort move out of the live namespace.
-    quarantine_dir = sidecar_path.parent / ".resume-quarantine"
-    target: Path | None = None
+    # 2) Best-effort move out of the live namespace — through the ONE shared
+    # implementation (``models.quarantine_denied_resume_sidecar``), so the
+    # publication path and the post-write denial recheck in ``Session.save``
+    # cannot drift into different quarantine semantics.
+    moved = None
     try:
-        quarantine_dir.mkdir(parents=True, exist_ok=True)
-        target = quarantine_dir / f"{sid}-{uuid.uuid4().hex}.json"
-        if sidecar_path.exists():
-            os.replace(sidecar_path, target)
-        else:
-            target = None
+        from api.models import quarantine_denied_resume_sidecar
+
+        moved = quarantine_denied_resume_sidecar(sid, source=sidecar_path)
     except Exception:
         logger.exception("Failed to quarantine untrusted resume sidecar %s", sidecar_path)
-        target = None
+    target: Path | None = moved
+    # 2b) A denial outranks any commit-complete proof, so a revoked id must not
+    # keep carrying one: the proof is the ONLY thing that authorises retiring a
+    # publication record or completing an orphan's commit, and a later reader
+    # must never find "committed" on an id that was durably refused. Best
+    # effort — the denial itself is what actually fences the id.
+    try:
+        from api.models import clear_resume_publication_commit_marker
+
+        clear_resume_publication_commit_marker(sid)
+    except Exception:
+        logger.debug("Failed to clear the Resume commit proof for %s", sid, exc_info=True)
     # 3) Evict any writable object a concurrent reader cached during the
     # publication/read-back window BEFORE reconciling the index. The denial
     # above already refuses it from cache, but eviction keeps the LRU and the
@@ -29480,12 +29532,6 @@ def _quarantine_resume_sidecar(sidecar_path: Path, sid: str) -> Path | None:
         prune_session_from_index(sid)
     except Exception:
         logger.debug("Failed to evict cached resume sidecar %s", sid, exc_info=True)
-    try:
-        import api.models as _models_mod
-
-        _models_mod._write_session_index()
-    except Exception:
-        logger.debug("Failed to reconcile session index after resume quarantine", exc_info=True)
     return target
 
 
@@ -29609,12 +29655,33 @@ def _await_resume_publication_commit(existing, sidecar_path: Path, sid: str, *, 
     when the first publisher is mid-verification and will commit shortly. Poll
     for the explicit verified marker for a bounded window; return ``None`` when
     no committed publication appears (the caller then fails closed).
+
+    F1/F2 (candidate5): the explicit verified marker is NOT commit-complete. The
+    winner still has rejection-capable work outstanding (index reconciliation and
+    the final denial check) after writing it, so a competing request may only
+    adopt the artifact once the winner's durable publishing record is GONE — and
+    that record is retired last, after the commit-complete proof. While the
+    record is still present without proof this returns ``None`` and the caller
+    fails closed with 409 instead of unguarding a publication that may still be
+    terminally rejected.
     """
+    from api.models import is_resume_publication_denied, resume_publication_commit_pending
+
     deadline = time.monotonic() + max(0.0, float(timeout))
     current = existing
     while True:
-        if _existing_sidecar_legacy_committed(current):
+        try:
+            pending = resume_publication_commit_pending(sid, canonical_path=sidecar_path)
+        except Exception:
+            logger.debug("Failed to read the Resume publication state for %s", sid, exc_info=True)
+            pending = True  # fail closed
+        if _existing_sidecar_legacy_committed(current) and not pending:
             return current
+        try:
+            if is_resume_publication_denied(sid):
+                return None
+        except Exception:
+            return None
         if time.monotonic() >= deadline:
             return None
         time.sleep(0.02)
@@ -29625,6 +29692,96 @@ def _await_resume_publication_commit(existing, sidecar_path: Path, sid: str, *, 
         if fresh is None:
             return None
         current = fresh
+
+
+def _resume_publication_commit_pending(sid: str, sidecar_path: Path) -> bool:
+    """Fail-closed form of the F1/F2 predicate: a record guards without proof."""
+    from api.models import resume_publication_commit_pending
+
+    try:
+        return resume_publication_commit_pending(sid, canonical_path=sidecar_path)
+    except Exception:
+        logger.debug("Failed to read the Resume publication state for %s", sid, exc_info=True)
+        return True
+
+
+def _resume_publication_orphan_is_dead(sid: str) -> bool:
+    """Fail-closed form of "this record's publisher is gone" (F2)."""
+    from api.models import recovery_orphan_is_dead
+
+    try:
+        return recovery_orphan_is_dead(sid)
+    except Exception:
+        logger.debug("Failed to classify the Resume publication record for %s", sid, exc_info=True)
+        return False
+
+
+def _complete_orphaned_resume_publication_commit(
+    sid: str,
+    existing,
+    sidecar_path: Path,
+    *,
+    profile: str,
+    db_path: Path,
+    root_id: str,
+    tip_id: str,
+    source_row,
+    report,
+) -> bool:
+    """Finish an orphaned publisher's commit as the new exclusive owner (F2).
+
+    A publisher that died after linking its canonical (possibly after writing the
+    verified marker) leaves a ``publishing`` record its own process can no longer
+    retire, and ``recover_crashed_resume_publication`` must refuse it — the
+    marker alone is not commit-complete. A *new* exclusive owner therefore has to
+    actually finish the commit. It may only do so after revalidating, against the
+    live source store, everything the dead publisher would have validated last:
+
+      * the artifact is a committed-looking (verified, non-denied) sidecar;
+      * its stored resume identity is exactly this resume's identity;
+      * the source row and lineage report still match this request's snapshot.
+
+    Only then is the durable commit-complete proof written for THAT artifact and
+    the record retired (``complete_crashed_resume_publication_commit``, which
+    additionally refuses a live owner, a same-process record and a denial).
+    Returns ``True`` only when the id is verifiably unguarded afterwards.
+    """
+    if existing is None:
+        return False
+    if not _existing_sidecar_legacy_committed(existing):
+        return False
+    try:
+        if _resume_existing_sidecar_conflict(
+            existing,
+            sid=sid,
+            profile=profile,
+            db_path=db_path,
+            root_id=root_id,
+            tip_id=tip_id,
+        ):
+            return False
+    except Exception:
+        logger.debug("Failed to revalidate the Resume identity for %s", sid, exc_info=True)
+        return False
+    try:
+        fresh_row, fresh_report, fresh_messages = _read_resume_source_snapshot(
+            db_path, sid, profile
+        )
+    except Exception:
+        logger.debug("Failed to re-read the Resume source snapshot for %s", sid, exc_info=True)
+        return False
+    if fresh_row != source_row or fresh_report != report:
+        # The source moved (or its lineage changed) after this request resolved
+        # it: the orphaned publication can no longer claim to be this lineage's
+        # terminal artifact, so it stays guarded and fail-closed.
+        return False
+    if list(getattr(existing, "messages", []) or []) != fresh_messages:
+        # A dead publisher may have left a verified but stale artifact. Two
+        # snapshots read by this retry cannot establish that artifact's content.
+        return False
+    from api.models import complete_crashed_resume_publication_commit
+
+    return complete_crashed_resume_publication_commit(sid, canonical_path=sidecar_path)
 
 
 def _handle_session_resume_in_webui(handler, body):
@@ -29719,36 +29876,46 @@ def _handle_session_resume_in_webui(handler, body):
     # F2 (Astra 94bfe8af): a canonical that a competing Resume has linked but
     # not yet committed is PROVISIONAL. Never treat it as an owned writable
     # sidecar (idempotent success) — wait briefly for the first publisher to
-    # commit the explicit verified marker, then fail closed.
-    if existing is not None and not _existing_sidecar_legacy_committed(existing):
-        existing = _await_resume_publication_commit(existing, sidecar_path, sid)
-        if existing is None:
-            return bad(
-                handler,
-                "a Resume for this session is still being verified; refresh and retry",
-                409,
-            )
+    # commit, then fail closed.
+    #
+    # F1/F2 (candidate5): "committed" now means commit-complete, not merely
+    # marked verified: while the winner's durable publishing record is still
+    # present the winner is doing rejection-capable work (index reconciliation,
+    # final denial check) and this request must fail closed. Only a LIVE
+    # publisher is worth waiting for; a record stranded by a crashed publisher is
+    # resolved below by the exclusive recovery/commit-completion path, because
+    # waiting for a dead pid could only time out.
+    if existing is not None and (
+        not _existing_sidecar_legacy_committed(existing)
+        or _resume_publication_commit_pending(sid, sidecar_path)
+    ):
+        if not _resume_publication_orphan_is_dead(sid):
+            existing = _await_resume_publication_commit(existing, sidecar_path, sid)
+            if existing is None:
+                return bad(
+                    handler,
+                    "a Resume for this session is still being verified; refresh and retry",
+                    409,
+                )
 
-    # Concurrent-writer guard: an unended source session may still be appended
-    # to by the process that owns it. The only stronger ownership signal we
-    # accept is that WebUI already holds a matching writable sidecar (a prior
-    # explicit resume), which makes this an idempotent re-resume.
+    # Concurrent-writer guard (B4): an unended source session may still be
+    # appended to by the process that owns it, so it is NEVER resumable — not
+    # even when WebUI already holds a matching writable sidecar from a previous
+    # explicit resume. A settled source can have been revived (``ended_at`` /
+    # ``end_reason`` cleared) after that sidecar was published, and the earlier
+    # "already owned" exemption then served an idempotent 200 over a source that
+    # is live again. The ended-source invariant is therefore checked BEFORE any
+    # idempotent success on every request: no project doc authoritatively grants
+    # an exemption from it.
     ended_at = source_row.get("ended_at")
     end_reason = str(source_row.get("end_reason") or "").strip()
     if not ended_at and not end_reason:
-        already_owned = (
-            existing is not None
-            and _existing_sidecar_legacy_committed(existing)
-            and _profiles_match(getattr(existing, "profile", None), profile)
-            and not bool(getattr(existing, "read_only", False))
+        return bad(
+            handler,
+            "source session appears active; refusing to resume a session "
+            "that may still be written by another process",
+            409,
         )
-        if not already_owned:
-            return bad(
-                handler,
-                "source session appears active; refusing to resume a session "
-                "that may still be written by another process",
-                409,
-            )
 
     # Lineage must match the client's exact root + tip so a stale sidebar entry
     # cannot resume a session whose continuation chain moved under it.
@@ -29774,6 +29941,67 @@ def _handle_session_resume_in_webui(handler, body):
         )
         if conflict:
             return bad(handler, conflict, 409)
+        # B1: idempotent success is still publication authority. A live
+        # publication record for this id means an uncommitted (or denied)
+        # attempt owns it — including a marker-less artifact whose marker was
+        # lost by a failing publication — so this must not be served writable.
+        from api.models import (
+            is_resume_publication_denied as _is_denied,
+            recover_crashed_resume_publication as _recover,
+            resume_publication_authority_blocked as _authority_blocked,
+        )
+
+        # F3: a publisher that crashed after writing its durable ``publishing``
+        # record (but before retiring it) strands this id behind a record no
+        # attempt owns. A new exclusive owner — proven here by taking the
+        # cross-process ownership lock — may safely recover it, but ONLY when the
+        # canonical is absent or a COMMIT-COMPLETE publication. A durable denial
+        # is never cleared by recovery, so fail-closed admission is not weakened.
+        try:
+            _recover(sid)
+        except Exception:
+            logger.debug(
+                "Failed to recover a stranded Resume publication record for %s",
+                sid,
+                exc_info=True,
+            )
+
+        if _authority_blocked(sid) or _is_denied(sid):
+            # F2: recovery above deliberately refuses an orphan whose canonical
+            # carries only the verified marker — that marker is not
+            # commit-complete, and clearing its record would resurrect a
+            # publication that still had rejection-capable work outstanding when
+            # its publisher died. Such an orphan is instead *finished*: this
+            # request is the new exclusive owner, it has revalidated the resume
+            # identity and the source snapshot, and it writes the durable
+            # commit-complete proof for that exact artifact before retiring the
+            # record (which itself refuses a live owner, a same-process record
+            # and any denial).
+            completed = False
+            try:
+                completed = _complete_orphaned_resume_publication_commit(
+                    sid,
+                    existing,
+                    sidecar_path,
+                    profile=profile,
+                    db_path=db_path,
+                    root_id=lineage_root_id,
+                    tip_id=lineage_tip_id,
+                    source_row=source_row,
+                    report=report,
+                )
+            except Exception:
+                logger.debug(
+                    "Failed to complete an orphaned Resume publication for %s",
+                    sid,
+                    exc_info=True,
+                )
+            if not completed or _authority_blocked(sid) or _is_denied(sid):
+                return bad(
+                    handler,
+                    "a Resume for this session is still being published; refresh and retry",
+                    409,
+                )
         return j(
             handler,
             {
@@ -29813,12 +30041,37 @@ def _handle_session_resume_in_webui(handler, body):
         RESUME_PUBLICATION_PROVISIONAL,
         _clear_webui_deleted_session_tombstone,
         _clear_webui_zero_message_orphan_tombstone,
+        begin_resume_publication,
         claim_session_for_resume,
         clear_resume_publication_denial,
+        finish_resume_publication,
+        is_resume_publication_denied,
+        mark_resume_publication_commit_complete,
         mark_resume_publication_verified,
         release_session_claim,
+        resume_claim_ownership_token,
+        resume_store_ownership_conflict,
     )
+    publication_record_retired = False
+    publication_authority_established = False
+    # F1: the durable attempt token is set when (and only when) this request takes
+    # the in-flight publication record. It is read by the broad post-link
+    # recovery, which Pyright cannot see is reached only after the assignment.
+    publication_attempt: str | None = None
+    # Q2/Q6: the claim's durable ownership token. It IS the publication attempt
+    # token (see ``begin_resume_publication``), and it makes this request's claim
+    # release attributable: a release that cannot be attributed must not close a
+    # live owner's descriptor.
+    claim_ownership_token: str | None = None
     if not claim_session_for_resume(sid):
+        # B2: distinguish a cross-process ownership conflict from an ordinary
+        # in-process save so the operator sees which authority refused.
+        if resume_store_ownership_conflict(sid):
+            return bad(
+                handler,
+                "another Resume for this session is in flight in another process; refresh and retry",
+                409,
+            )
         return bad(
             handler,
             "a save for this session is in flight; refresh and retry",
@@ -29832,6 +30085,11 @@ def _handle_session_resume_in_webui(handler, body):
             # ``publish_staged_session_sidecar`` (an exclusive ``os.link`` whose
             # FileExistsError is reconciled below) instead of being serialized by
             # ``session_file_write_lock``.
+            # Q2/Q6: record this request's ownership token the moment the claim is
+            # live. Everything below (attempt token, retirement, release) is
+            # attributable to it, so a stray or stale release can never drop the
+            # epoch's descriptor while an attempt still owns it.
+            claim_ownership_token = resume_claim_ownership_token(sid)
             # Re-open one fresh read snapshot at the publication boundary. The
             # first snapshot proves internal consistency; this second read
             # detects any source-row, lineage, or transcript change that landed
@@ -29892,6 +30150,34 @@ def _handle_session_resume_in_webui(handler, body):
                     or bool(getattr(staged, "read_only", True))
                 ):
                     raise RuntimeError("staged sidecar failed resume verification")
+                # B1: establish durable publication authority BEFORE the artifact
+                # can exist. If this fails, no canonical may be published at
+                # all — an artifact whose denial cannot be recorded durably must
+                # never be created, because a fresh lookup could then serve it
+                # and keep serving it after a restart. The record also makes the
+                # id fail closed by itself while the attempt is in flight or if
+                # this process dies mid-publication.
+                try:
+                    publication_attempt = begin_resume_publication(sid)
+                    publication_authority_established = True
+                except OSError as authority_exc:
+                    logger.error(
+                        "Refusing Resume in WebUI: durable publication authority "
+                        "could not be established: %s",
+                        _sanitize_error(authority_exc),
+                    )
+                    # Q7: the staged payload is already on disk (staged and
+                    # verified above), and nothing has been published, so without
+                    # this the refused request orphans a file in
+                    # ``.resume-staging`` for no reader — the same dead weight the
+                    # FileExistsError branch below discards.
+                    _discard_resume_staging_file(staging_path)
+                    return bad(
+                        handler,
+                        "could not establish durable Resume publication authority; "
+                        "refusing to publish",
+                        500,
+                    )
                 try:
                     # The canonical path does not exist until this exclusive atomic
                     # claim. Readers can observe either no writable sidecar or the
@@ -29942,6 +30228,32 @@ def _handle_session_resume_in_webui(handler, body):
                     )
                     if conflict:
                         return bad(handler, conflict, 409)
+                    # Q1: a revocation that landed *inside this race window* (after
+                    # the legacy/committed pre-check and before this point) is not
+                    # a lost race to report as idempotent success. Check denial
+                    # first, as its own refusal: nothing is retired here — the
+                    # denial owns the record — and ``publication_record_retired``
+                    # therefore stays False, so the bookkeeping below cannot claim
+                    # a retirement that never happened.
+                    if is_resume_publication_denied(sid):
+                        return bad(
+                            handler,
+                            "a Resume for this session is still being published; refresh and retry",
+                            409,
+                        )
+                    # B1/B2: this attempt lost the exclusive claim race, so it
+                    # produced no artifact — but its own durable publication
+                    # record (written before the claim attempt) would otherwise
+                    # keep guarding an id whose winner has already committed.
+                    # Retire it and verify the id is genuinely unguarded before
+                    # reporting idempotent success.
+                    if not finish_resume_publication(sid, attempt=publication_attempt):
+                        return bad(
+                            handler,
+                            "a Resume for this session is still being published; refresh and retry",
+                            409,
+                        )
+                    publication_record_retired = True
                     idempotent_after_race = True
                     s = published
                 else:
@@ -29999,7 +30311,9 @@ def _handle_session_resume_in_webui(handler, body):
                         # move the untrusted canonical out of the live
                         # namespace; the rejection raised here is never turned
                         # back into a success, even if the move itself failed.
-                        _quarantine_resume_sidecar(sidecar_path, sid)
+                        _quarantine_resume_sidecar(
+                            sidecar_path, sid, attempt=publication_attempt
+                        )
                         raise _ResumePublicationRejected(
                             "published sidecar failed post-publish verification"
                         )
@@ -30007,8 +30321,24 @@ def _handle_session_resume_in_webui(handler, body):
                     # this point may the session be served writable or
                     # advertised by the sidebar/index.
                     verified_session = mark_resume_publication_verified(published)
+                    # F3: the denial clear is authority-gated and returns whether
+                    # the denial is *verifiably* gone; a denial that survives
+                    # means this publication is still refused (a newer,
+                    # concurrent revocation outranks it), so it must not be
+                    # reported as success. The clear runs while this attempt
+                    # still holds the in-flight record — that record is its
+                    # proof of authority.
+                    denial_cleared = clear_resume_publication_denial(
+                        sid, attempt=publication_attempt
+                    )
+                    # F1: the durable publication record is this attempt's
+                    # authority and MUST outlive index reconciliation AND the
+                    # final authority check below. It is retired LAST (see the
+                    # commit block after the final check); retiring it early left
+                    # a committed artifact with no durable guard, so a
+                    # post-commit rejection could neither deny nor quarantine it
+                    # and it stayed served writable.
                     try:
-                        clear_resume_publication_denial(sid)
                         # Route the index write through the models module
                         # attribute (not the import-time alias) so an
                         # index I/O fault is observable/attributable at the
@@ -30022,7 +30352,10 @@ def _handle_session_resume_in_webui(handler, body):
                         # verified commit. Do NOT silently adopt it: re-validate
                         # that the explicit verified artifact is still intact
                         # and the denial state is absent, and otherwise treat the
-                        # publication as terminally rejected (F1).
+                        # publication as terminally rejected (F1). This artifact
+                        # is THIS attempt's own commit, so the rejection is
+                        # forced: the committed-publication protection must never
+                        # block quarantining our own failing commit.
                         logger.warning(
                             "Failed to reconcile index after verified Resume publication",
                             exc_info=True,
@@ -30049,10 +30382,77 @@ def _handle_session_resume_in_webui(handler, body):
                             )
                             and list(getattr(still, "messages", []) or []) == messages
                         ):
-                            _quarantine_resume_sidecar(sidecar_path, sid)
+                            _quarantine_resume_sidecar(
+                                sidecar_path,
+                                sid,
+                                attempt=publication_attempt,
+                                force=True,
+                            )
                             raise _ResumePublicationRejected(
                                 "published sidecar failed post-publish verification"
                             ) from None
+                    # F3: verify publication authority one last time BEFORE the
+                    # response. A denial that is still recorded (or that a
+                    # concurrent revocation landed after the clear) means this
+                    # artifact is not servable, so the request must fail closed
+                    # instead of returning 200 over an artifact every lookup
+                    # will refuse. The artifact is ours (this attempt committed
+                    # the verified marker), so revoking it is legitimate.
+                    if not denial_cleared or is_resume_publication_denied(sid):
+                        _quarantine_resume_sidecar(
+                            sidecar_path,
+                            sid,
+                            attempt=publication_attempt,
+                            force=True,
+                        )
+                        raise _ResumePublicationRejected(
+                            "Resume publication denial could not be cleared; "
+                            "refusing to report success"
+                        )
+                    # B1/F3: the verified marker is a COMMIT only once the durable
+                    # publication record is retired — and that happens
+                    # LAST, only after the index reconciled and the final
+                    # authority check passed, so this attempt's authority guards
+                    # the id for the whole window between the verified commit and
+                    # the response. While the record survives, every lookup
+                    # refuses the artifact, so a failed retire must never report
+                    # success. The retire itself is this attempt's own action on
+                    # its own record; a rejection here force-quarantines the
+                    # artifact this attempt committed.
+                    #
+                    # F1/F2: the retire is gated on the durable
+                    # commit-complete proof, which is written HERE — after index
+                    # reconciliation and after the final denial check, the last
+                    # rejection-capable steps — and binds this exact artifact.
+                    # Without it the marker alone would claim "committed" while
+                    # this attempt could still reject the publication, which is
+                    # exactly what let a same-epoch sibling unlink this record
+                    # mid-commit (F1) and a restart resurrect the artifact (F2).
+                    if not mark_resume_publication_commit_complete(
+                        sid,
+                        attempt=publication_attempt,
+                        canonical_path=sidecar_path,
+                    ):
+                        _quarantine_resume_sidecar(
+                            sidecar_path,
+                            sid,
+                            attempt=publication_attempt,
+                            force=True,
+                        )
+                        raise _ResumePublicationRejected(
+                            "could not record the durable Resume commit-complete proof"
+                        )
+                    if not finish_resume_publication(sid, attempt=publication_attempt):
+                        _quarantine_resume_sidecar(
+                            sidecar_path,
+                            sid,
+                            attempt=publication_attempt,
+                            force=True,
+                        )
+                        raise _ResumePublicationRejected(
+                            "could not complete the durable Resume publication commit"
+                        )
+                    publication_record_retired = True
                     s = verified_session
             except _ResumePublicationRejected:
                 # Terminal: the canonical was already denied + quarantined.
@@ -30094,7 +30494,18 @@ def _handle_session_resume_in_webui(handler, body):
                     recovered_after_publish_error = True
                 else:
                     if sidecar_path.exists() or recovered is not None:
-                        _quarantine_resume_sidecar(sidecar_path, sid)
+                        # F1: this branch won the exclusive ``os.link``, so any
+                        # canonical here is THIS attempt's own artifact. Force the
+                        # quarantine: the committed-publication protection must
+                        # never block revoking our own failing commit, and a
+                        # transient readback failure (recovered=None) must not
+                        # skip the durable denial.
+                        _quarantine_resume_sidecar(
+                            sidecar_path,
+                            sid,
+                            attempt=publication_attempt,
+                            force=True,
+                        )
                     raise persist_exc
         except _ResumePublicationRejected as rejected_exc:
             logger.error(
@@ -30106,7 +30517,55 @@ def _handle_session_resume_in_webui(handler, body):
             logger.exception("Failed to persist Resume in WebUI sidecar")
             return bad(handler, _sanitize_error(exc), 500)
     finally:
-        release_session_claim(sid)
+        # B1 bookkeeping: a publication record must not outlive an attempt that
+        # neither published nor denied anything. If this attempt created no
+        # canonical and recorded no denial, retire its record so an unrelated
+        # refusal (for example "source changed while validating") cannot
+        # permanently guard the id. A live artifact or a recorded denial keeps
+        # its record: that IS the durable fail-closed state.
+        #
+        # F1 (candidate5): this abort is only safe while no sibling Resume is in
+        # flight. Same-epoch siblings share ONE durable record, so without the
+        # exclusivity proof below a sibling that aborts mid-flight (no canonical
+        # *yet*) could drop the record the other sibling is about to publish
+        # under — exactly the guard the winner's commit-complete transition
+        # depends on. The in-process claim registry is the authority: this
+        # request must still be the only live claim, and it must be its own.
+        try:
+            if (
+                publication_authority_established
+                and not publication_record_retired
+                and not sidecar_path.exists()
+                and not is_resume_publication_denied(sid)
+            ):
+                from api.models import (
+                    close_resume_abort_retirement,
+                    open_resume_abort_retirement,
+                )
+
+                if not open_resume_abort_retirement(
+                    sid, ownership_token=claim_ownership_token
+                ):
+                    logger.debug(
+                        "Leaving the Resume publication record for %s: another "
+                        "claim for this id is still in flight",
+                        sid,
+                    )
+                else:
+                    try:
+                        # Keep admissions closed until this attempt's durable
+                        # guard has been retired.
+                        finish_resume_publication(sid, attempt=publication_attempt)
+                    finally:
+                        close_resume_abort_retirement(
+                            sid, ownership_token=claim_ownership_token
+                        )
+        except Exception:
+            logger.debug("Failed to retire a stray Resume publication record", exc_info=True)
+        # Q6: release with the token this request captured from the claim, so an
+        # extra or stale release can never close the live epoch's descriptor.
+        # A missing token is refused rather than guessing another claim's owner.
+        release_session_claim(sid, ownership_token=claim_ownership_token)
     assert s is not None
     _publish_session_list_changed(
         "session_resume_in_webui_reconciled" if recovered_after_publish_error else "session_resume_in_webui",
@@ -30161,7 +30620,7 @@ def _handle_session_import(handler, body):
     with LOCK:
         SESSIONS[s.session_id] = s
         SESSIONS.move_to_end(s.session_id)
-        _evict_sessions_over_cap()  # #4765: safe LRU eviction (never active/unsaved)
+    _evict_sessions_over_cap()  # #4765: persistence probes stay outside LOCK
     s.save()
     publish_session_list_changed("session_import")
     return j(
