@@ -71,8 +71,16 @@ def state_db_readonly_uri(db_path, platform: str | None = None) -> str:
     return state_db_file_uri(db_path, platform=platform) + "?mode=ro"
 
 
-def open_state_db_readonly(db_path: Path, log: logging.Logger | None = None) -> sqlite3.Connection:
+def open_state_db_readonly(
+    db_path: Path,
+    log: logging.Logger | None = None,
+    *,
+    strict: bool = False,
+) -> sqlite3.Connection:
     """Open the live agent ``state.db`` read-only for a pure-read projection.
+
+    ``strict`` is retained for compatibility with callers that explicitly mark
+    foreign-profile reads; all opens are now strict read-only regardless.
 
     Same rationale as the session-listing path (#5455): a write-capable handle
     on the multi-GB, WAL ``state.db`` while the agent streams into it adds
