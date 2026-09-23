@@ -221,10 +221,10 @@ _WEBUI_DELETED_SESSION_TOMBSTONE_LOCK = threading.Lock()
 # lock the #765 contract forbids:
 #
 #   * ``begin_session_save`` / ``end_session_save`` bracket one ordinary save.
-#     Two concurrent saves of the same id both register and still reach their
-#     distinct ``.tmp.<pid>.<tid>`` files and ``os.replace`` in parallel — the
-#     registry lock is held only for the momentary counter update, never across
-#     disk I/O. Saves of different ids never touch each other's state.
+#     Each save holds a shared kernel lock through its final ``os.replace``;
+#     concurrent saves remain admitted, while a Resume's exclusive lock is
+#     fenced across processes. The registry lock is held only for momentary
+#     counter updates, never across sidecar disk I/O.
 #   * Resume refuses (409) while any ordinary writer for that id is active, so
 #     it never races a save that was admitted before the claim.
 #   * Once a Resume claim is active, new saves for that id refuse rather than
@@ -233,14 +233,14 @@ _WEBUI_DELETED_SESSION_TOMBSTONE_LOCK = threading.Lock()
 #     remains the backstop that blocks a stale writer whose in-process
 #     registration lapsed (for example across a process restart).
 #
-# Nothing here serializes unrelated ids. Ordinary saves — the #765 hot path —
-# never touch the filesystem under this lock. The *first* concurrent claim for
+# Nothing here serializes unrelated ids. The *first* concurrent claim for
 # an id marks an in-flight acquisition under the registry lock, releases it for
 # durable cross-process ownership I/O, then re-enters it to publish the fd after
 # revalidating the in-memory state. Same-id siblings wait on that in-flight
 # acquisition; unrelated ids never wait for its filesystem work (B2/Q5).
 _SESSION_CLAIM_LOCK = threading.Lock()
 _SESSION_CLAIM_STATE: dict[str, dict] = {}
+_SESSION_SAVE_FDS: dict[tuple[int, str], list[int]] = {}
 # Q5: how long a sibling claim waits for an in-flight durable ownership
 # acquisition of the same id before re-examining the registry. The acquisition
 # is a local mkdir/open/flock/ftruncate/write/fsync, so this is only reached on a
@@ -261,6 +261,87 @@ RESUME_PUBLISH_LOCK_DIRNAME = ".resume-publish"
 RESUME_LEDGER_LOCK_DIRNAME = ".resume-ledger-locks"
 
 
+def _windows_lock_file_fd(fd, *, exclusive: bool) -> bool:  # pragma: no cover - native Windows
+    """Take a non-blocking shared/exclusive byte-range lock with LockFileEx."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _Overlapped(ctypes.Structure):
+            _fields_ = [
+                ("Internal", ctypes.c_size_t),
+                ("InternalHigh", ctypes.c_size_t),
+                ("Offset", wintypes.DWORD),
+                ("OffsetHigh", wintypes.DWORD),
+                ("hEvent", wintypes.HANDLE),
+            ]
+
+        win_dll = getattr(ctypes, "WinDLL", None)
+        if win_dll is None:
+            return False
+        kernel32 = win_dll("kernel32", use_last_error=True)
+        lock_file_ex = kernel32.LockFileEx
+        lock_file_ex.argtypes = [
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.POINTER(_Overlapped),
+        ]
+        lock_file_ex.restype = wintypes.BOOL
+        handle = _msvcrt.get_osfhandle(fd)  # type: ignore[union-attr]
+        if handle == -1:
+            return False
+        flags = 0x00000001  # LOCKFILE_FAIL_IMMEDIATELY
+        if exclusive:
+            flags |= 0x00000002  # LOCKFILE_EXCLUSIVE_LOCK
+        overlapped = _Overlapped()
+        return bool(lock_file_ex(
+            wintypes.HANDLE(handle), flags, 0, 1, 0, ctypes.byref(overlapped)
+        ))
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
+def _windows_unlock_file_fd(fd) -> None:  # pragma: no cover - native Windows
+    """Release the LockFileEx range used by the Resume/save fence."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _Overlapped(ctypes.Structure):
+            _fields_ = [
+                ("Internal", ctypes.c_size_t),
+                ("InternalHigh", ctypes.c_size_t),
+                ("Offset", wintypes.DWORD),
+                ("OffsetHigh", wintypes.DWORD),
+                ("hEvent", wintypes.HANDLE),
+            ]
+
+        win_dll = getattr(ctypes, "WinDLL", None)
+        if win_dll is None:
+            return
+        kernel32 = win_dll("kernel32", use_last_error=True)
+        unlock_file_ex = kernel32.UnlockFileEx
+        unlock_file_ex.argtypes = [
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.POINTER(_Overlapped),
+        ]
+        unlock_file_ex.restype = wintypes.BOOL
+        handle = _msvcrt.get_osfhandle(fd)  # type: ignore[union-attr]
+        if handle != -1:
+            overlapped = _Overlapped()
+            unlock_file_ex(
+                wintypes.HANDLE(handle), 0, 1, 0, ctypes.byref(overlapped)
+            )
+    except (AttributeError, OSError, ValueError):
+        logger.debug("Failed to unlock Windows Resume ownership fd", exc_info=True)
+
+
 def _flock_resume_lock_fd(fd) -> bool:
     """Take a NON-blocking exclusive kernel lock on *fd*; ``False`` if held.
 
@@ -277,14 +358,7 @@ def _flock_resume_lock_fd(fd) -> bool:
         except OSError:
             return False
     if _msvcrt is not None:  # pragma: no cover - native Windows
-        try:
-            if os.fstat(fd).st_size == 0:
-                os.write(fd, b"\0")
-            os.lseek(fd, 0, os.SEEK_SET)
-            _msvcrt.locking(fd, _msvcrt.LK_NBLCK, 1)  # type: ignore[attr-defined]
-            return True
-        except OSError:
-            return False
+        return _windows_lock_file_fd(fd, exclusive=True)
     return False
 
 
@@ -297,11 +371,20 @@ def _unlock_resume_lock_fd(fd) -> None:
             logger.debug("Failed to unlock Resume ownership fd", exc_info=True)
         return
     if _msvcrt is not None:  # pragma: no cover - native Windows
+        _windows_unlock_file_fd(fd)
+
+
+def _flock_session_save_fd(fd) -> bool:
+    """Take a non-blocking shared save fence; fail closed if unavailable."""
+    if _fcntl is not None:
         try:
-            os.lseek(fd, 0, os.SEEK_SET)
-            _msvcrt.locking(fd, _msvcrt.LK_UNLCK, 1)  # type: ignore[attr-defined]
+            _fcntl.flock(fd, _fcntl.LOCK_SH | _fcntl.LOCK_NB)
+            return True
         except OSError:
-            logger.debug("Failed to unlock Resume ownership fd", exc_info=True)
+            return False
+    if _msvcrt is not None:  # pragma: no cover - native Windows
+        return _windows_lock_file_fd(fd, exclusive=False)
+    return False
 
 
 def _open_resume_lock_fd(path: Path) -> int | None:
@@ -400,50 +483,73 @@ def resume_store_ownership_conflict(sid, *, session_dir: "Path | None" = None) -
 
 
 def begin_session_save(sid) -> bool:
-    """Register an ordinary canonical save for *sid*.
+    """Register and durably fence an ordinary canonical save for *sid*.
 
     Returns ``False`` (a fail-closed refusal) when a Resume claim currently owns
-    the id; callers must not proceed to write. Concurrent ordinary saves of the
-    same id are all admitted — this is an active-writer count, not a lock.
+    the id in this or another process. Concurrent ordinary saves of the same id
+    are admitted on POSIX via shared locks.
     """
     sid = str(sid or "")
     if not sid:
         return True
+    if not is_safe_session_id(sid):
+        raise ValueError(
+            f"Unsafe session_id {sid!r}; refusing to create a save fence outside session store"
+        )
+    fd = _open_resume_lock_fd(resume_publish_lock_path(sid))
+    if fd is None or not _flock_session_save_fd(fd):
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        return False
     with _SESSION_CLAIM_LOCK:
         state = _SESSION_CLAIM_STATE.get(sid)
         if state is None:
             state = {"writers": 0, "claims": 0, "acquiring": False}
             _SESSION_CLAIM_STATE[sid] = state
-        if int(state.get("claims", 0)) > 0:
-            return False
-        if state.get("acquiring"):
-            # Q5: a Resume claim for this id is acquiring its durable ownership
-            # record right now. The claim must not race a writer that the
-            # ownership record cannot see, so the writer is refused (fail
-            # closed) instead of admitted into the window. Only this id is
-            # affected: unrelated ids take neither this branch nor the lock
-            # across the acquisition.
+        if int(state.get("claims", 0)) > 0 or state.get("acquiring"):
+            _unlock_resume_lock_fd(fd)
+            try:
+                os.close(fd)
+            except OSError:
+                pass
             return False
         state["writers"] = int(state.get("writers", 0)) + 1
+        key = (threading.get_ident(), sid)
+        _SESSION_SAVE_FDS.setdefault(key, []).append(fd)
         return True
 
 
 def end_session_save(sid) -> None:
-    """Release the ordinary-save registration taken by ``begin_session_save``."""
+    """Release the ordinary-save registration and durable fence."""
     sid = str(sid or "")
     if not sid:
         return
+    fd = None
     with _SESSION_CLAIM_LOCK:
+        key = (threading.get_ident(), sid)
+        stack = _SESSION_SAVE_FDS.get(key)
+        if stack:
+            fd = stack.pop()
+            if not stack:
+                _SESSION_SAVE_FDS.pop(key, None)
         state = _SESSION_CLAIM_STATE.get(sid)
-        if state is None:
-            return
-        state["writers"] = max(0, int(state.get("writers", 0)) - 1)
-        if (
-            int(state.get("writers", 0)) == 0
-            and int(state.get("claims", 0)) == 0
-            and not state.get("acquiring")
-        ):
-            _SESSION_CLAIM_STATE.pop(sid, None)
+        if state is not None:
+            state["writers"] = max(0, int(state.get("writers", 0)) - 1)
+            if (
+                int(state.get("writers", 0)) == 0
+                and int(state.get("claims", 0)) == 0
+                and not state.get("acquiring")
+            ):
+                _SESSION_CLAIM_STATE.pop(sid, None)
+    if fd is not None:
+        _unlock_resume_lock_fd(fd)
+        try:
+            os.close(fd)
+        except OSError:
+            logger.debug("Failed to close ordinary session-save fence", exc_info=True)
 
 
 def _resume_store_root(session_dir: "Path | None" = None) -> Path:
@@ -9406,6 +9512,7 @@ def import_cli_session(
     resume_source_state_db=None,
     resume_lineage_root_id=None,
     resume_lineage_tip_id=None,
+    workspace=None,
     persist=True,
 ):
     """Create a new WebUI session populated with CLI/agent messages.
@@ -9417,7 +9524,7 @@ def import_cli_session(
     s = Session(
         session_id=session_id,
         title=title,
-        workspace=get_last_workspace(profile=profile),
+        workspace=workspace or get_last_workspace(profile=profile),
         model=model,
         messages=messages,
         profile=profile,

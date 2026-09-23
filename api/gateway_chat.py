@@ -315,7 +315,7 @@ def _gateway_base_url_for_profile(
     """Return the multiplexed Gateway URL for one WebUI session profile."""
     base_url = _gateway_base_url(config_data, environ)
     normalized = profile.strip() if isinstance(profile, str) else ""
-    if not normalized:
+    if not normalized or normalized == "default":
         return base_url
     return f"{base_url}/p/{urllib.parse.quote(normalized, safe='')}"
 

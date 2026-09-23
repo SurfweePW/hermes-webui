@@ -14674,7 +14674,7 @@ def handle_get(handler, parsed) -> bool:
     if parsed.path == "/api/chat/stream/status":
         stream_id = parse_qs(parsed.query).get("stream_id", [""])[0]
         if not _stream_id_visible_to_request_profile(handler, stream_id):
-            return j(handler, {"error": "stream is not visible to the active profile"}, status=403)
+            return True
         active = stream_id in STREAMS
         payload = {"active": active, "stream_id": stream_id, "replay_available": False}
         try:
@@ -14691,7 +14691,7 @@ def handle_get(handler, parsed) -> bool:
         if not stream_id:
             return bad(handler, "stream_id required")
         if not _stream_id_visible_to_request_profile(handler, stream_id):
-            return j(handler, {"error": "stream is not visible to the active profile"}, status=403)
+            return True
         gateway_stop_blocked = False
         try:
             from api.gateway_chat import (
@@ -29569,7 +29569,7 @@ def _read_source_session_row(
         wanted = [
             c for c in (
                 "id", "title", "model", "source", "session_source", "parent_session_id",
-                "started_at", "ended_at", "end_reason",
+                "started_at", "ended_at", "end_reason", "cwd",
             )
             if c in cols
         ]
@@ -29595,14 +29595,29 @@ def _read_resume_source_snapshot(db_path: Path, sid: str, profile: str):
                 raise_on_error=True,
                 connection=conn,
             )
-            messages = get_state_db_session_messages(
-                sid,
-                profile=profile,
-                state_db_path=db_path,
-                strict_read_only=True,
-                raise_on_error=True,
-                connection=conn,
-            )
+            # Read exactly the lineage segments that the report validated.  Do
+            # not ask the message helper to rediscover the ancestry: older
+            # sessions schemas can support the lineage report without carrying
+            # every optional column used by that helper's stitch heuristic.
+            segment_ids = [
+                str(segment.get("session_id") or "").strip()
+                for segment in reversed(report.get("segments") or [])
+                if isinstance(segment, dict)
+            ]
+            segment_ids = [segment_id for segment_id in segment_ids if segment_id]
+            if not segment_ids:
+                segment_ids = [sid]
+            messages = []
+            for segment_id in segment_ids:
+                messages.extend(get_state_db_session_messages(
+                    segment_id,
+                    profile=profile,
+                    state_db_path=db_path,
+                    strict_read_only=True,
+                    raise_on_error=True,
+                    connection=conn,
+                    stitch_continuations=False,
+                ))
             return source_row, report, messages
         finally:
             conn.rollback()
@@ -30137,6 +30152,7 @@ def _handle_session_resume_in_webui(handler, body):
                     resume_source_state_db=str(db_path),
                     resume_lineage_root_id=lineage_root_id,
                     resume_lineage_tip_id=lineage_tip_id,
+                    workspace=source_row.get("cwd"),
                     persist=False,
                 )
                 # F2/F3: the staged payload explicitly carries PROVISIONAL

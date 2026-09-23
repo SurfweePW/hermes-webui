@@ -1590,7 +1590,7 @@ def test_local_stop_uses_runs_api_stop_endpoint():
             return None
 
         def geturl(self):
-            return "http://gw:8642/p/default/v1/runs/run-stop/stop"
+            return "http://gw:8642/v1/runs/run-stop/stop"
 
     requests = []
 
@@ -1612,7 +1612,7 @@ def test_local_stop_uses_runs_api_stop_endpoint():
         _clear_gateway_run_starting(stream_id)
 
     request, timeout = requests[0]
-    assert request.full_url == "http://gw:8642/p/default/v1/runs/run-stop/stop"
+    assert request.full_url == "http://gw:8642/v1/runs/run-stop/stop"
     assert request.get_method() == "POST"
     assert request.get_header("Authorization") == "Bearer secret"
     assert timeout == 10
@@ -3160,7 +3160,7 @@ def test_gateway_approval_response_relay():
         from api.routes import _handle_approval_respond
         _handle_approval_respond(handler, body)
 
-    assert captured.get("url", "") == "http://gw:8642/p/default/v1/runs/run%20abc%2F1/approval"
+    assert captured.get("url", "") == "http://gw:8642/v1/runs/run%20abc%2F1/approval"
     assert captured["body"] == {"choice": "once", "approval_id": ""}
     handler.send_response.assert_called_with(200)
 

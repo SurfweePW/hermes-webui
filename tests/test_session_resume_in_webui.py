@@ -452,6 +452,32 @@ def test_lineage_continuation_happy_path(resume_env):
         env["rec"], _body(sid="sess-tip", root="sess-root", tip="sess-tip"))
     assert env["rec"].status == 200, env["rec"].error()
     assert env["rec"].payload()["resumed"] is True
+    saved = env["models"].Session.load("sess-tip")
+    assert saved is not None
+    assert len(saved.messages) == 6
+
+
+def test_lineage_without_started_at_imports_every_validated_segment(resume_env):
+    db = _alpha_db(resume_env)
+    _make_state_db(db, sid="sess-root", ended_at=None,
+                   end_reason="compression")
+    _make_state_db(db, sid="sess-tip", parent_session_id="sess-root",
+                   ended_at=1700000100.0, end_reason="cli_close")
+    conn = sqlite3.connect(str(db))
+    try:
+        conn.execute("ALTER TABLE sessions DROP COLUMN started_at")
+        conn.commit()
+    finally:
+        conn.close()
+
+    env = resume_env
+    env["routes"]._handle_session_resume_in_webui(
+        env["rec"], _body(sid="sess-tip", root="sess-root", tip="sess-tip"))
+
+    assert env["rec"].status == 200, env["rec"].error()
+    saved = env["models"].Session.load("sess-tip")
+    assert saved is not None
+    assert len(saved.messages) == 6
 
 
 def test_obsolete_ancestor_with_continuation_is_rejected(resume_env):
@@ -505,6 +531,8 @@ def test_happy_path_materialises_writable_sidecar_and_leaves_source_untouched(re
     assert saved.source_tag == "cli"
     assert saved.raw_source == "cli"
     assert saved.title == "A finished CLI chat"
+    assert saved.workspace == str(Path("/tmp/ws").resolve())
+    assert saved.created_workspace == str(Path("/tmp/ws").resolve())
     assert len(saved.messages) == 4
     assert saved.resume_source_profile == "alpha"
     assert saved.resume_source_state_db == str(db.resolve())
@@ -2465,6 +2493,102 @@ while time.time() < deadline and not Path(done).exists():
 models.release_session_claim(sid, ownership_token=claim_token)
 sys.exit(0 if acquired else 3)
 """
+
+
+def test_cross_process_resume_owner_blocks_ordinary_save(resume_env, tmp_path):
+    """An ordinary save shares the durable fence through its final replace."""
+    env = resume_env
+    sid = "cross-process-save-fence"
+    result_path = tmp_path / "save-result.txt"
+    script = r"""
+import sys
+from pathlib import Path
+
+repo, session_dir, sid, result_path = sys.argv[1:]
+sys.path.insert(0, repo)
+from api import models
+
+models.SESSION_DIR = Path(session_dir)
+session = models.Session(
+    session_id=sid,
+    title="foreign ordinary writer",
+    workspace=session_dir,
+    profile="alpha",
+)
+try:
+    session.save()
+except PermissionError:
+    Path(result_path).write_text("refused", encoding="utf-8")
+else:
+    Path(result_path).write_text("saved", encoding="utf-8")
+"""
+
+    assert env["models"].claim_session_for_resume(sid) is True
+    claim_token = env["models"].resume_claim_ownership_token(sid)
+    assert claim_token
+    try:
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                script,
+                str(Path(__file__).resolve().parents[1]),
+                str(env["sessions_dir"]),
+                sid,
+                str(result_path),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert result_path.read_text(encoding="utf-8") == "refused"
+        assert not (env["sessions_dir"] / f"{sid}.json").exists()
+    finally:
+        assert env["models"].release_session_claim(
+            sid, ownership_token=claim_token
+        ) is True
+
+
+@pytest.mark.parametrize("sid", ["../escape", "/absolute/escape"])
+def test_ordinary_save_fence_rejects_unsafe_id_before_filesystem_io(
+    resume_env, monkeypatch, sid
+):
+    models = resume_env["models"]
+
+    def forbidden_open(_path):  # pragma: no cover - assertion is the behavior
+        pytest.fail("unsafe id reached the lock-file opener")
+
+    monkeypatch.setattr(models, "_open_resume_lock_fd", forbidden_open)
+    with pytest.raises(ValueError, match="Unsafe session_id"):
+        models.begin_session_save(sid)
+
+
+def test_windows_save_and_resume_fences_request_shared_and_exclusive_locks(
+    resume_env, monkeypatch
+):
+    models = resume_env["models"]
+    calls = []
+    unlocks = []
+
+    monkeypatch.setattr(models, "_fcntl", None)
+    monkeypatch.setattr(models, "_msvcrt", object())
+    monkeypatch.setattr(
+        models,
+        "_windows_lock_file_fd",
+        lambda fd, *, exclusive: calls.append((fd, exclusive)) or True,
+    )
+    monkeypatch.setattr(
+        models, "_windows_unlock_file_fd", lambda fd: unlocks.append(fd)
+    )
+
+    assert models._flock_session_save_fd(10) is True
+    assert models._flock_resume_lock_fd(11) is True
+    models._unlock_resume_lock_fd(11)
+
+    assert calls == [(10, False), (11, True)]
+    assert unlocks == [11]
 
 
 def _wait_for_file(path: Path, timeout: float = 30.0) -> bool:

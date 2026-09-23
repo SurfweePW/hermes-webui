@@ -2612,9 +2612,11 @@ async function _openSidebarSession(session, loadOpts={}){
   }
   // #5409: close mobile sidebar AFTER veto guard passes — only close if open proceeds.
   if(typeof closeMobileSidebar==='function')closeMobileSidebar();
-  if(_isExternalSession(session)&&!_isReadOnlySession(session)){
-    try{await api('/api/session/import_cli',{method:'POST',body:JSON.stringify(_externalImportPayload(session))});}
-    catch(_e){ /* import failed -- fall through to read-only view */ }
+  if(_isExternalSession(session)){
+    if(!_isReadOnlySession(session)){
+      try{await api('/api/session/import_cli',{method:'POST',body:JSON.stringify(_externalImportPayload(session))});}
+      catch(_e){ /* import failed -- fall through to read-only view */ }
+    }
   }
   await _ensureSidebarSessionProfile(session);
   // Tell loadSession to skip its pre-hook — we already ran it above.

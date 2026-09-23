@@ -222,7 +222,8 @@ def test_readonly_menu_branch_and_row_open_path_unchanged():
         "  }"
     ) in menu
     open_row = _function_body(SESSIONS_JS, "_openSidebarSession")
-    assert "if(_isExternalSession(session)&&!_isReadOnlySession(session)){" in open_row
+    assert "if(_isExternalSession(session)){" in open_row
+    assert "if(!_isReadOnlySession(session)){" in open_row
     assert "/api/session/import_cli" in open_row
     assert "await _ensureSidebarSessionProfile(session);" in open_row
     assert "await loadSession(session.session_id," in open_row

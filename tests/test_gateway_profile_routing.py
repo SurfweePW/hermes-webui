@@ -89,7 +89,7 @@ def _run_stop_with_bound_profile(stream_id, run_id, profile):
     response.code = 202
     response.geturl.return_value = (
         f"http://127.0.0.1:8642"
-        f"{'' if not profile else '/p/' + profile}"
+        f"{'' if not profile or profile == 'default' else '/p/' + profile}"
         f"/v1/runs/{run_id}/stop"
     )
     response.__enter__.return_value = response
@@ -126,8 +126,8 @@ def test_stop_gateway_run_treats_bound_empty_profile_as_owned_owner_route():
     assert request.get_header("Authorization") == "Bearer secret"
 
 
-def test_stop_gateway_run_keeps_default_prefix_for_explicit_default_profile():
-    """An explicit ``'default'`` binding still targets ``/p/default``."""
+def test_stop_gateway_run_uses_root_route_for_explicit_default_profile():
+    """The root/default profile is served without a multiplexing prefix."""
     result, opener, _ = _run_stop_with_bound_profile(
         "stream-default-profile-stop", "run-default-profile", "default"
     )
@@ -136,7 +136,7 @@ def test_stop_gateway_run_keeps_default_prefix_for_explicit_default_profile():
     opener.open.assert_called_once()
     request = opener.open.call_args.args[0]
     assert request.full_url == (
-        "http://127.0.0.1:8642/p/default/v1/runs/run-default-profile/stop"
+        "http://127.0.0.1:8642/v1/runs/run-default-profile/stop"
     )
 
 
